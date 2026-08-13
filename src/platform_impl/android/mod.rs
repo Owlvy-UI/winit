@@ -384,6 +384,14 @@ impl<T: 'static> EventLoop<T> {
                     MotionAction::Up | MotionAction::PointerUp => Some(event::TouchPhase::Ended),
                     MotionAction::Move => Some(event::TouchPhase::Moved),
                     MotionAction::Cancel => Some(event::TouchPhase::Cancelled),
+                    MotionAction::HoverEnter
+                    | MotionAction::HoverMove
+                    | MotionAction::HoverExit => {
+                        // Hover reaches the view hierarchy, where accessibility
+                        // turns it into the node under the pointer.
+                        input_status = InputStatus::Unhandled;
+                        None
+                    },
                     _ => {
                         None // TODO mouse events
                     },
