@@ -279,6 +279,21 @@ pub struct FileDropHandlerData {
     // makes the source's `IDragSourceHelper` bitmap actually render under the cursor over our
     // own window and any other helper-aware target.
     drop_target_helper: Option<NonNull<IDropTargetHelper>>,
+    // The position and action last sent as `DragPosition` for the active transfer.
+    last_drag_report: Option<DragReport>,
+}
+
+/// What a `DragPosition` event reports.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DragReport {
+    x: i32,
+    y: i32,
+    action: Option<DndAction>,
+}
+
+/// Whether `next` differs from the report sent last and therefore has to be sent.
+fn is_new_report(last: Option<DragReport>, next: DragReport) -> bool {
+    last != Some(next)
 }
 
 pub struct FileDropHandler {
@@ -300,6 +315,7 @@ impl FileDropHandler {
             send_event,
             active_data_transfer_id: None,
             drop_target_helper: None,
+            last_drag_report: None,
         });
         FileDropHandler { data: Box::into_raw(data) }
     }
@@ -403,6 +419,7 @@ impl FileDropHandler {
         let source_drag = drop_handler.runner.source_drag.get();
         let data_transfer_id = source_drag.map_or_else(next_data_transfer_id, |info| info.id);
         drop_handler.active_data_transfer_id = Some(data_transfer_id);
+        drop_handler.last_drag_report = None;
 
         let wid = WindowId::from_raw(drop_handler.window.addr());
 
@@ -504,6 +521,7 @@ impl FileDropHandler {
             return E_ABORT;
         };
 
+        drop_handler.last_drag_report = None;
         (drop_handler.send_event)(WindowEvent::DragLeft { id: data_transfer_id });
         drop_handler.runner.remove_data_transfer(data_transfer_id);
 
@@ -544,6 +562,7 @@ impl FileDropHandler {
             ScreenToClient(drop_handler.window, &mut pt_client);
         }
         Self::report_position(drop_handler, data_transfer_id, pt_client, proposed_action);
+        drop_handler.last_drag_report = None;
 
         // New scope to make sure that the `Ref` returned by `current_drag_actions` is dropped
         // before we call `remove_data_transfer`.
@@ -592,16 +611,22 @@ impl FileDropHandler {
         S_OK
     }
 
-    /// Sends `DragPosition`.
+    /// Sends `DragPosition` unless the point and the action equal the ones sent last.
     fn report_position(
         drop_handler: &mut FileDropHandlerData,
         id: DataTransferId,
         pt_client: POINT,
         proposed_action: Option<DndAction>,
     ) {
+        let report = DragReport { x: pt_client.x, y: pt_client.y, action: proposed_action };
+        if !is_new_report(drop_handler.last_drag_report, report) {
+            return;
+        }
+
+        drop_handler.last_drag_report = Some(report);
         (drop_handler.send_event)(WindowEvent::DragPosition {
             id,
-            position: PhysicalPosition::new(f64::from(pt_client.x), f64::from(pt_client.y)),
+            position: PhysicalPosition::new(f64::from(report.x), f64::from(report.y)),
             proposed_action,
         });
     }
@@ -1668,5 +1693,16 @@ mod tests {
         );
         assert_eq!(drop_effect_to_dnd_action(pick_effect(&actions, 0, ALL)), Some(DndAction::Move));
         assert_eq!(drop_effect_to_dnd_action(DROPEFFECT_NONE), None);
+    }
+
+    #[test]
+    fn drag_report_is_sent_only_when_it_changes() {
+        let report = DragReport { x: 3, y: 4, action: Some(DndAction::Copy) };
+        assert!(is_new_report(None, report));
+        assert!(!is_new_report(Some(report), report));
+        assert!(is_new_report(Some(report), DragReport { x: 4, ..report }));
+        assert!(is_new_report(Some(report), DragReport { y: -4, ..report }));
+        assert!(is_new_report(Some(report), DragReport { action: Some(DndAction::Move), ..report }));
+        assert!(is_new_report(Some(report), DragReport { action: None, ..report }));
     }
 }
