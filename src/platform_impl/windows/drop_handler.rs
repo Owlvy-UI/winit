@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::ffi::{c_void, OsString};
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
@@ -5,7 +6,8 @@ use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::core::{IUnknown, GUID, HRESULT};
-use windows_sys::Win32::Foundation::{DV_E_FORMATETC, HWND, POINTL, S_OK};
+use windows_sys::Win32::Foundation::{DV_E_FORMATETC, HWND, POINT, POINTL, S_OK};
+use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::System::Com::{IDataObject, DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
 use windows_sys::Win32::System::Ole::{CF_HDROP, DROPEFFECT_COPY, DROPEFFECT_NONE};
 use windows_sys::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
@@ -15,9 +17,10 @@ use tracing::debug;
 use crate::platform_impl::platform::definitions::{
     IDataObjectVtbl, IDropTarget, IDropTargetVtbl, IUnknownVtbl,
 };
-use crate::platform_impl::platform::WindowId;
+use crate::platform_impl::platform::{WindowId, DEVICE_ID};
 
-use crate::event::Event;
+use crate::dpi::PhysicalPosition;
+use crate::event::{Event, WindowEvent};
 use crate::window::WindowId as RootWindowId;
 
 #[repr(C)]
@@ -80,13 +83,19 @@ impl FileDropHandler {
         this: *mut IDropTarget,
         pDataObj: *const IDataObject,
         _grfKeyState: u32,
-        _pt: *const POINTL,
+        pt: *const POINTL,
         pdwEffect: *mut u32,
     ) -> HRESULT {
         use crate::event::WindowEvent::HoveredFile;
         let drop_handler = unsafe { Self::from_interface(this) };
+        // SAFETY: OLE passes either null or a valid `POINTL` for the duration of the call.
+        let pt = unsafe { pt.as_ref() };
+        let position_sent = Cell::new(false);
         let hdrop = unsafe {
             Self::iterate_filenames(pDataObj, |filename| {
+                if !position_sent.replace(true) {
+                    drop_handler.send_position(pt);
+                }
                 drop_handler.send_event(Event::WindowEvent {
                     window_id: RootWindowId(WindowId(drop_handler.window)),
                     event: HoveredFile(filename),
@@ -106,10 +115,15 @@ impl FileDropHandler {
     pub unsafe extern "system" fn DragOver(
         this: *mut IDropTarget,
         _grfKeyState: u32,
-        _pt: *const POINTL,
+        pt: *const POINTL,
         pdwEffect: *mut u32,
     ) -> HRESULT {
         let drop_handler = unsafe { Self::from_interface(this) };
+        if drop_handler.hovered_is_valid {
+            // SAFETY: OLE passes either null or a valid `POINTL` for the duration of the call.
+            drop_handler.send_position(unsafe { pt.as_ref() });
+        }
+
         unsafe {
             *pdwEffect = drop_handler.cursor_effect;
         }
@@ -134,13 +148,19 @@ impl FileDropHandler {
         this: *mut IDropTarget,
         pDataObj: *const IDataObject,
         _grfKeyState: u32,
-        _pt: *const POINTL,
+        pt: *const POINTL,
         _pdwEffect: *mut u32,
     ) -> HRESULT {
         use crate::event::WindowEvent::DroppedFile;
         let drop_handler = unsafe { Self::from_interface(this) };
+        // SAFETY: OLE passes either null or a valid `POINTL` for the duration of the call.
+        let pt = unsafe { pt.as_ref() };
+        let position_sent = Cell::new(false);
         let hdrop = unsafe {
             Self::iterate_filenames(pDataObj, |filename| {
+                if !position_sent.replace(true) {
+                    drop_handler.send_position(pt);
+                }
                 drop_handler.send_event(Event::WindowEvent {
                     window_id: RootWindowId(WindowId(drop_handler.window)),
                     event: DroppedFile(filename),
@@ -213,6 +233,27 @@ impl FileDropHandler {
 impl FileDropHandlerData {
     fn send_event(&self, event: Event<()>) {
         (self.send_event)(event);
+    }
+
+    /// Sends `CursorMoved` for a drag at the screen point `pt`.
+    fn send_position(&self, pt: Option<&POINTL>) {
+        let Some(pt) = pt else {
+            return;
+        };
+
+        let mut point = POINT { x: pt.x, y: pt.y };
+        // SAFETY: `self.window` is the window this target is registered for and `point` is a
+        // valid, writable `POINT`.
+        if unsafe { ScreenToClient(self.window, &mut point) } == false.into() {
+            debug!("Failed to convert the drag position into client coordinates.");
+            return;
+        }
+
+        let position = PhysicalPosition::new(f64::from(point.x), f64::from(point.y));
+        self.send_event(Event::WindowEvent {
+            window_id: RootWindowId(WindowId(self.window)),
+            event: WindowEvent::CursorMoved { device_id: DEVICE_ID, position },
+        });
     }
 }
 

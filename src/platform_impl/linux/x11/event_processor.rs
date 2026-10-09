@@ -4,6 +4,7 @@ use std::os::raw::{c_char, c_int, c_long, c_ulong};
 use std::slice;
 use std::sync::{Arc, Mutex};
 
+use tracing::warn;
 use x11_dl::xinput2::{
     self, XIDeviceEvent, XIEnterEvent, XIFocusInEvent, XIFocusOutEvent, XIHierarchyEvent,
     XILeaveEvent, XIModifierState, XIRawEvent,
@@ -535,12 +536,32 @@ impl EventProcessor {
                     .send_status(window, source_window, DndState::Accepted)
                     .expect("Failed to send `XdndStatus` message.");
             }
+
+            match self.dnd.pointer_in_window(wt.root, window, xev.data.get_long(2)) {
+                Ok((device, position)) => {
+                    self.dnd.pointer = Some((device, position));
+                    let event = Event::WindowEvent {
+                        window_id,
+                        event: WindowEvent::CursorMoved { device_id: mkdid(device), position },
+                    };
+                    callback(&self.target, event);
+                },
+                Err(err) => warn!("Failed to locate the pointer of a drag: {err}"),
+            }
             return;
         }
 
         if xev.message_type == atoms[XdndDrop] as c_ulong {
             let (source_window, state) = if let Some(source_window) = self.dnd.source_window {
                 if let Some(Ok(ref path_list)) = self.dnd.result {
+                    if let Some((device, position)) = self.dnd.pointer {
+                        let event = Event::WindowEvent {
+                            window_id,
+                            event: WindowEvent::CursorMoved { device_id: mkdid(device), position },
+                        };
+                        callback(&self.target, event);
+                    }
+
                     for path in path_list {
                         let event = Event::WindowEvent {
                             window_id,

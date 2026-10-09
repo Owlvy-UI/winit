@@ -5,11 +5,13 @@ use std::str::Utf8Error;
 use std::sync::Arc;
 
 use percent_encoding::percent_decode;
+use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt};
 
 use super::atoms::AtomName::None as DndNone;
 use super::atoms::*;
 use super::{util, CookieResultExt, X11Error, XConnection};
+use crate::dpi::PhysicalPosition;
 
 #[derive(Debug, Clone, Copy)]
 pub enum DndState {
@@ -47,11 +49,20 @@ pub struct Dnd {
     pub source_window: Option<xproto::Window>,
     // Populated by SelectionNotify event handler (triggered by XdndPosition event handler)
     pub result: Option<Result<Vec<PathBuf>, DndDataParseError>>,
+    // Populated by XdndPosition event handler
+    pub pointer: Option<(xinput::DeviceId, PhysicalPosition<f64>)>,
 }
 
 impl Dnd {
     pub fn new(xconn: Arc<XConnection>) -> Result<Self, X11Error> {
-        Ok(Dnd { xconn, version: None, type_list: None, source_window: None, result: None })
+        Ok(Dnd {
+            xconn,
+            version: None,
+            type_list: None,
+            source_window: None,
+            result: None,
+            pointer: None,
+        })
     }
 
     pub fn reset(&mut self) {
@@ -59,6 +70,24 @@ impl Dnd {
         self.type_list = None;
         self.source_window = None;
         self.result = None;
+        self.pointer = None;
+    }
+
+    /// Returns the client pointer and the position of an `XdndPosition` message inside `window`.
+    pub fn pointer_in_window(
+        &self,
+        root: xproto::Window,
+        window: xproto::Window,
+        packed_position: c_long,
+    ) -> Result<(xinput::DeviceId, PhysicalPosition<f64>), X11Error> {
+        let (root_x, root_y) = unpack_position(packed_position);
+        let conn = self.xconn.xcb_connection();
+        let coords = conn.translate_coordinates(root, window, root_x, root_y)?;
+        let pointer = conn.xinput_xi_get_client_pointer(x11rb::NONE)?;
+        let coords = coords.reply()?;
+        let pointer = pointer.reply()?;
+        let position = PhysicalPosition::new(f64::from(coords.dst_x), f64::from(coords.dst_y));
+        Ok((pointer.deviceid, position))
     }
 
     pub unsafe fn send_status(
@@ -170,5 +199,41 @@ impl Dnd {
         } else {
             Err(DndDataParseError::EmptyData)
         }
+    }
+}
+
+/// Splits the root window coordinates packed into an `XdndPosition` message as `(x << 16) | y`.
+fn unpack_position(packed: c_long) -> (i16, i16) {
+    (low_i16(packed >> 16), low_i16(packed))
+}
+
+/// Reinterprets the low 16 bits of `value` as a signed coordinate.
+fn low_i16(value: c_long) -> i16 {
+    let [low, high, ..] = value.to_le_bytes();
+    i16::from_le_bytes([low, high])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unpacks_positive_coordinates() {
+        assert_eq!(unpack_position((640 << 16) | 480), (640, 480));
+    }
+
+    #[test]
+    fn unpacks_zero() {
+        assert_eq!(unpack_position(0), (0, 0));
+    }
+
+    #[test]
+    fn unpacks_negative_coordinates() {
+        assert_eq!(unpack_position((0xfff6 << 16) | 0xffec), (-10, -20));
+    }
+
+    #[test]
+    fn unpacks_extremes() {
+        assert_eq!(unpack_position((0x7fff << 16) | 0x8000), (i16::MAX, i16::MIN));
     }
 }

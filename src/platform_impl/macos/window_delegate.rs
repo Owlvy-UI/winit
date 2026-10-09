@@ -9,11 +9,11 @@ use core_graphics::display::{CGDisplay, CGPoint};
 use monitor::VideoModeHandle;
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{declare_class, msg_send_id, mutability, sel, ClassType, DeclaredClass};
+use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSAppKitVersionNumber, NSAppKitVersionNumber10_12, NSAppearance, NSAppearanceCustomization,
     NSAppearanceNameAqua, NSApplication, NSApplicationPresentationOptions, NSBackingStoreType,
-    NSColor, NSDraggingDestination, NSFilenamesPboardType, NSPasteboard,
+    NSColor, NSDragOperation, NSDraggingDestination, NSFilenamesPboardType, NSPasteboard,
     NSRequestUserAttentionType, NSScreen, NSView, NSWindowButton, NSWindowDelegate,
     NSWindowFullScreenButton, NSWindowLevel, NSWindowOcclusionState, NSWindowOrderingMode,
     NSWindowSharingType, NSWindowStyleMask, NSWindowTabbingMode, NSWindowTitleVisibility,
@@ -32,7 +32,7 @@ use super::monitor::{self, flip_window_screen_coordinates, get_display_id};
 use super::observer::RunLoop;
 use super::view::WinitView;
 use super::window::WinitWindow;
-use super::{ffi, Fullscreen, MonitorHandle, OsError, WindowId};
+use super::{ffi, Fullscreen, MonitorHandle, OsError, WindowId, DEVICE_ID};
 use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error::{ExternalError, NotSupportedError, OsError as RootOsError};
 use crate::event::{InnerSizeWriter, WindowEvent};
@@ -123,6 +123,8 @@ pub(crate) struct State {
     is_simple_fullscreen: Cell<bool>,
     saved_style: Cell<Option<NSWindowStyleMask>>,
     is_borderless_game: Cell<bool>,
+    /// Whether the drag over the window carries files.
+    drag_has_files: Cell<bool>,
 }
 
 declare_class!(
@@ -375,9 +377,15 @@ declare_class!(
             let pb: Retained<NSPasteboard> = unsafe { msg_send_id![sender, draggingPasteboard] };
             let filenames = match pb.propertyListForType(unsafe { NSFilenamesPboardType }) {
                 Some(filenames) => filenames,
-                None => return false.into(),
+                None => {
+                    self.ivars().drag_has_files.set(false);
+                    return false.into();
+                },
             };
             let filenames: Retained<NSArray<NSString>> = unsafe { Retained::cast(filenames) };
+
+            self.ivars().drag_has_files.set(true);
+            self.queue_drag_position(sender);
 
             filenames.into_iter().for_each(|file| {
                 let path = PathBuf::from(file.to_string());
@@ -385,6 +393,19 @@ declare_class!(
             });
 
             true
+        }
+
+        /// Invoked periodically as the image is held within the destination area
+        #[method(draggingUpdated:)]
+        fn dragging_updated(&self, sender: &NSObject) -> NSDragOperation {
+            trace_scope!("draggingUpdated:");
+
+            if !self.ivars().drag_has_files.get() {
+                return NSDragOperation::None;
+            }
+
+            self.queue_drag_position(sender);
+            NSDragOperation::Copy
         }
 
         /// Invoked when the image is released
@@ -408,6 +429,9 @@ declare_class!(
             };
             let filenames: Retained<NSArray<NSString>> = unsafe { Retained::cast(filenames) };
 
+            self.ivars().drag_has_files.set(false);
+            self.queue_drag_position(sender);
+
             filenames.into_iter().for_each(|file| {
                 let path = PathBuf::from(file.to_string());
                 self.queue_event(WindowEvent::DroppedFile(path));
@@ -426,6 +450,7 @@ declare_class!(
         #[method(draggingExited:)]
         fn dragging_exited(&self, _sender: Option<&NSObject>) {
             trace_scope!("draggingExited:");
+            self.ivars().drag_has_files.set(false);
             self.queue_event(WindowEvent::HoveredFileCancelled);
         }
     }
@@ -735,6 +760,7 @@ impl WindowDelegate {
             is_simple_fullscreen: Cell::new(false),
             saved_style: Cell::new(None),
             is_borderless_game: Cell::new(attrs.platform_specific.borderless_game),
+            drag_has_files: Cell::new(false),
         });
         let delegate: Retained<WindowDelegate> = unsafe { msg_send_id![super(delegate), init] };
 
@@ -818,6 +844,19 @@ impl WindowDelegate {
 
     pub(crate) fn queue_event(&self, event: WindowEvent) {
         self.ivars().app_delegate.maybe_queue_window_event(self.window().id(), event);
+    }
+
+    /// Queues `CursorMoved` for the location of the drag `sender` (an `NSDraggingInfo`).
+    fn queue_drag_position(&self, sender: &NSObject) {
+        // SAFETY: `sender` conforms to `NSDraggingInfo`, whose `draggingLocation` returns an
+        // `NSPoint` in window coordinates.
+        let window_point: NSPoint = unsafe { msg_send![sender, draggingLocation] };
+        let view_point = self.view().convertPoint_fromView(window_point, None);
+        let position = LogicalPosition::new(view_point.x, view_point.y);
+        self.queue_event(WindowEvent::CursorMoved {
+            device_id: DEVICE_ID,
+            position: position.to_physical(self.scale_factor()),
+        });
     }
 
     fn handle_scale_factor_changed(&self, scale_factor: CGFloat) {

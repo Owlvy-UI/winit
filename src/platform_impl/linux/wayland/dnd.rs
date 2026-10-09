@@ -25,9 +25,10 @@ use sctk::reexports::client::protocol::wl_data_source::WlDataSource;
 use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::reexports::client::{Connection, Proxy, QueueHandle};
 
+use crate::dpi::{LogicalPosition, PhysicalPosition};
 use crate::event::WindowEvent;
 use crate::platform_impl::wayland::state::WinitState;
-use crate::platform_impl::wayland::{make_wid, WindowId};
+use crate::platform_impl::wayland::{make_wid, DeviceId, WindowId};
 
 /// The only MIME type that is accepted.
 const TEXT_URI_LIST: &str = "text/uri-list";
@@ -55,6 +56,8 @@ struct ActiveDrag {
     offer: DragOffer,
     data_device: ObjectId,
     window_id: WindowId,
+    /// Last pointer position in surface local logical coordinates.
+    position: (f64, f64),
     /// Whether `HoveredFile` was sent for this drag.
     hovered: bool,
     /// Whether the drop happened.
@@ -71,6 +74,23 @@ pub struct DndState {
 }
 
 impl WinitState {
+    /// Sends `CursorMoved` for a drag at surface local logical `(x, y)` over `window_id`.
+    fn dnd_report_position(&mut self, window_id: WindowId, (x, y): (f64, f64)) {
+        let scale_factor = match self.windows.borrow().get(&window_id).map(|window| window.lock()) {
+            Some(Ok(window)) => window.scale_factor(),
+            Some(Err(_)) => {
+                warn!("Window state is poisoned, dropping the drag position");
+                return;
+            },
+            None => return,
+        };
+
+        let device_id = crate::event::DeviceId(crate::platform_impl::DeviceId::Wayland(DeviceId));
+        let position = drag_position(x, y, scale_factor);
+        self.events_sink
+            .push_window_event(WindowEvent::CursorMoved { device_id, position }, window_id);
+    }
+
     /// Ends the active drag without a drop.
     fn dnd_cancel_active(&mut self) {
         let Some(drag) = self.dnd_state.active.take() else {
@@ -197,6 +217,7 @@ impl WinitState {
                                 .push_window_event(WindowEvent::HoveredFileCancelled, window_id);
                         }
                     } else {
+                        self.dnd_report_position(window_id, drag.position);
                         for path in paths {
                             self.events_sink
                                 .push_window_event(WindowEvent::DroppedFile(path), window_id);
@@ -219,8 +240,8 @@ impl DataDeviceHandler for WinitState {
         _: &Connection,
         _: &QueueHandle<Self>,
         data_device: &WlDataDevice,
-        _x: f64,
-        _y: f64,
+        x: f64,
+        y: f64,
         surface: &WlSurface,
     ) {
         // A new enter replaces whatever drag was active before.
@@ -260,11 +281,13 @@ impl DataDeviceHandler for WinitState {
             offer,
             data_device: data_device.id(),
             window_id,
+            position: (x, y),
             hovered: false,
             dropped: false,
             transfer: None,
         });
 
+        self.dnd_report_position(window_id, (x, y));
         self.dnd_start_transfer(Phase::Hover);
     }
 
@@ -280,7 +303,26 @@ impl DataDeviceHandler for WinitState {
         }
     }
 
-    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
+    fn motion(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        data_device: &WlDataDevice,
+        x: f64,
+        y: f64,
+    ) {
+        let Some(drag) = self.dnd_state.active.as_mut() else {
+            return;
+        };
+
+        if drag.dropped || drag.data_device != data_device.id() {
+            return;
+        }
+
+        drag.position = (x, y);
+        let window_id = drag.window_id;
+        self.dnd_report_position(window_id, (x, y));
+    }
 
     fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
 
@@ -363,6 +405,11 @@ impl DataSourceHandler for WinitState {
 
 sctk::delegate_data_device!(WinitState);
 
+/// Converts surface local logical coordinates into physical window coordinates.
+fn drag_position(x: f64, y: f64, scale_factor: f64) -> PhysicalPosition<f64> {
+    LogicalPosition::new(x, y).to_physical(scale_factor)
+}
+
 /// Extracts local file paths from a `text/uri-list` payload.
 ///
 /// Comment lines, entries that are not `file` URIs, and URIs naming a remote host
@@ -415,6 +462,28 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
 
     use super::*;
+
+    fn is_near(position: PhysicalPosition<f64>, x: f64, y: f64) -> bool {
+        (position.x - x).abs() < 1e-9 && (position.y - y).abs() < 1e-9
+    }
+
+    #[test]
+    fn drag_position_at_integer_scale() {
+        assert!(is_near(drag_position(10.0, 20.5, 2.0), 20.0, 41.0));
+    }
+
+    #[test]
+    fn drag_position_at_fractional_scale() {
+        assert!(is_near(drag_position(100.0, 40.0, 1.25), 125.0, 50.0));
+        assert!(is_near(drag_position(8.0, 2.0, 1.5), 12.0, 3.0));
+        assert!(is_near(drag_position(10.0, 10.0, 1.2), 12.0, 12.0));
+    }
+
+    #[test]
+    fn drag_position_at_origin_and_unit_scale() {
+        assert!(is_near(drag_position(0.0, 0.0, 1.75), 0.0, 0.0));
+        assert!(is_near(drag_position(33.25, 7.5, 1.0), 33.25, 7.5));
+    }
 
     #[test]
     fn single_file() {

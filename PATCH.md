@@ -1,7 +1,7 @@
 # Why this fork exists
 
-Branched from `v0.30.13`. It carries two changes on top of the release. The
-Wayland drag and drop part becomes obsolete once a stable upstream 0.31 is
+Branched from `v0.30.13`. It carries three changes on top of the release. The
+drag and drop parts become obsolete once a stable upstream 0.31 is
 adopted. Delete the whole fork at that point, provided the Android hover change
 is upstream by then as well.
 
@@ -49,7 +49,7 @@ Behaviour, matching the X11 backend of 0.30:
 - On drop the list is read again, `DroppedFile` is emitted for every file, and
   the offer is finished and destroyed. When no file could be read from a drop,
   `HoveredFileCancelled` is emitted instead if hover events were sent before.
-- Pointer motion during a drag produces no event, as on X11.
+- Pointer motion during a drag is reported as `CursorMoved`, see section 3.
 - Only `file:` URIs without a host or with `localhost` are reported. Paths are
   percent decoded into raw bytes, so non UTF-8 names survive. Comments, other
   schemes, remote hosts and paths containing NUL are skipped with a warning.
@@ -57,5 +57,43 @@ Behaviour, matching the X11 backend of 0.30:
 - Transfers are read without blocking through the event loop and capped at
   4 MiB. Malformed or oversized data is logged and ignored.
 
-Not ported: outgoing drags, selection (clipboard) offers, drag positions and
-action negotiation, since 0.30 has no API for them.
+Not ported: outgoing drags, selection (clipboard) offers and action
+negotiation, since 0.30 has no API for them.
+
+## 3. The pointer is reported while a file is dragged
+
+In winit 0.30 no backend reports where a file is dragged or dropped. The drag
+source owns the pointer during the drag, so the target window gets no regular
+pointer motion: XDND and Wayland deliver positions only through drag messages,
+Windows OLE through `IDropTarget`, and AppKit through `NSDraggingDestination`.
+Upstream 0.31 carries the position in new `DragEntered` and `DragPosition` events.
+This fork keeps the 0.30 API and sends `WindowEvent::CursorMoved` instead.
+
+On every desktop backend, for a drag that is accepted as a file drag:
+
+- `CursorMoved` is sent when the drag enters the window, on every movement over
+  it, and once more directly before the first `DroppedFile` of a drop.
+- The position is physical and relative to the window, like any other
+  `CursorMoved`. The device ID is the one the backend uses for its pointer.
+- Drags that are rejected (no files) produce no `CursorMoved`.
+- No `CursorEntered` or `CursorLeft` is synthesized. The platforms send their
+  own pointer enter and leave around a drag, and synthetic ones would pair up
+  with those wrongly, for example a second enter after the drop.
+
+Per backend:
+
+- Wayland, `src/platform_impl/linux/wayland/dnd.rs`: from `wl_data_device`
+  enter and motion, converted from surface local logical coordinates with the
+  window scale factor, which includes fractional scale. The last position is
+  repeated before `DroppedFile` once the drop data is read.
+- X11, `src/platform_impl/linux/x11/dnd.rs` and `event_processor.rs`: from each
+  accepted `XdndPosition`. The root coordinates are translated into the window
+  and the device is the client pointer (`XIGetClientPointer`). `XdndDrop`
+  carries no position, so the last one is repeated before `DroppedFile`.
+- Windows, `src/platform_impl/windows/drop_handler.rs`: from the screen point
+  of `DragEnter`, `DragOver` and `Drop`, through `ScreenToClient`. On enter and
+  drop it is sent before the first file event.
+- macOS, `src/platform_impl/macos/window_delegate.rs`: from `draggingLocation`
+  in `draggingEntered:`, the newly implemented `draggingUpdated:` and
+  `performDragOperation:`, converted like regular mouse motion.
+  `draggingUpdated:` returns the same operation as `draggingEntered:`.
