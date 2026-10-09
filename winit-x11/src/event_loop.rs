@@ -893,7 +893,7 @@ impl RootActiveEventLoop for ActiveEventLoop {
             return Err(os_error!(UnknownDataTransfer(id)).into());
         }
 
-        state.accepted = !actions.is_empty();
+        state.valid_actions = actions.to_vec();
 
         Ok(())
     }

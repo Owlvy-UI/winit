@@ -613,6 +613,7 @@ impl RootActiveEventLoop for ActiveEventLoop {
             data_object,
             drop_source,
             allowed_effects,
+            actions: allowed_actions.to_vec(),
         }));
 
         Ok(id)

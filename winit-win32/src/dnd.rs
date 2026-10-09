@@ -400,17 +400,17 @@ impl FileDropHandler {
         // and seed actions from the mask declared at `start_drag` - the app's `DragEntered`
         // handler can't call `set_valid_actions` in time because it's buffered until `DoDragDrop`
         // returns.
-        let data_transfer_id = drop_handler
-            .runner
-            .source_drag
-            .get()
-            .map_or_else(next_data_transfer_id, |info| info.id);
+        let source_drag = drop_handler.runner.source_drag.get();
+        let data_transfer_id = source_drag.map_or_else(next_data_transfer_id, |info| info.id);
         drop_handler.active_data_transfer_id = Some(data_transfer_id);
 
         let wid = WindowId::from_raw(drop_handler.window.addr());
 
         let data = Arc::new(unsafe { DataObject::from_idataobject(pDataObj) });
         drop_handler.runner.register_data_transfer(data_transfer_id, wid, data);
+        if source_drag.is_some() {
+            drop_handler.runner.seed_source_drag_actions(data_transfer_id);
+        }
 
         let pt_screen = POINT { x: pt.x, y: pt.y };
         let mut pt_client = pt_screen;
@@ -475,15 +475,12 @@ impl FileDropHandler {
         unsafe {
             ScreenToClient(drop_handler.window, &mut pt_client);
         }
-        let position = PhysicalPosition::new(pt_client.x as f64, pt_client.y as f64);
-
-        let proposed_action = drop_handler.runner.proposed_dnd_action(data_transfer_id, effects);
-
-        (drop_handler.send_event)(WindowEvent::DragPosition {
-            id: data_transfer_id,
-            position,
-            proposed_action,
-        });
+        let proposed_action = drop_effect_to_dnd_action(pick_effect(
+            &drop_handler.runner.current_drag_actions(data_transfer_id),
+            grfKeyState,
+            effects,
+        ));
+        Self::report_position(drop_handler, data_transfer_id, pt_client, proposed_action);
 
         // Get actions after the event handler has run, so that we update it based on the user's
         // supplied info.
@@ -535,21 +532,18 @@ impl FileDropHandler {
         };
 
         let effects = unsafe { pdwEffect.read() };
-        let proposed_action = drop_handler.runner.proposed_dnd_action(data_transfer_id, effects);
+        let proposed_action = drop_effect_to_dnd_action(pick_effect(
+            &drop_handler.runner.current_drag_actions(data_transfer_id),
+            grfKeyState,
+            effects,
+        ));
 
         let pt_screen = POINT { x: pt.x, y: pt.y };
         let mut pt_client = pt_screen;
         unsafe {
             ScreenToClient(drop_handler.window, &mut pt_client);
         }
-        let pt = pt_client;
-        let position = PhysicalPosition::new(pt.x as f64, pt.y as f64);
-
-        (drop_handler.send_event)(WindowEvent::DragPosition {
-            id: data_transfer_id,
-            position,
-            proposed_action,
-        });
+        Self::report_position(drop_handler, data_transfer_id, pt_client, proposed_action);
 
         // New scope to make sure that the `Ref` returned by `current_drag_actions` is dropped
         // before we call `remove_data_transfer`.
@@ -558,8 +552,6 @@ impl FileDropHandler {
             // supplied info.
             let actions = drop_handler.runner.current_drag_actions(data_transfer_id);
             let source_allowed = unsafe { pdwEffect.read() };
-            let proposed_action =
-                drop_handler.runner.proposed_dnd_action(data_transfer_id, effects);
 
             // Negotiate the effect first so we can pick the right outgoing event. If the app
             // rejected the drop (e.g. via `set_valid_actions(none())`), `pick_effect` returns
@@ -570,7 +562,10 @@ impl FileDropHandler {
             let event = if effect == DROPEFFECT_NONE {
                 WindowEvent::DragLeft { id: data_transfer_id }
             } else {
-                WindowEvent::DragDropped { id: data_transfer_id, proposed_action }
+                WindowEvent::DragDropped {
+                    id: data_transfer_id,
+                    proposed_action: drop_effect_to_dnd_action(effect),
+                }
             };
             (drop_handler.send_event)(event);
             unsafe {
@@ -595,6 +590,20 @@ impl FileDropHandler {
         }
 
         S_OK
+    }
+
+    /// Sends `DragPosition`.
+    fn report_position(
+        drop_handler: &mut FileDropHandlerData,
+        id: DataTransferId,
+        pt_client: POINT,
+        proposed_action: Option<DndAction>,
+    ) {
+        (drop_handler.send_event)(WindowEvent::DragPosition {
+            id,
+            position: PhysicalPosition::new(f64::from(pt_client.x), f64::from(pt_client.y)),
+            proposed_action,
+        });
     }
 
     unsafe fn from_interface<'a, InterfaceT>(this: *mut InterfaceT) -> &'a mut FileDropHandlerData {
@@ -1613,5 +1622,51 @@ mod tests {
         let end_fragment = parse_offset(&buf, "EndFragment");
         let fragment = std::str::from_utf8(&buf[start_fragment..end_fragment]).unwrap();
         assert_eq!(fragment, "<p>hi</p>");
+    }
+
+    const MK_SHIFT: u32 = 0x0004;
+    const MK_CONTROL: u32 = 0x0008;
+    const ALL: u32 = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+
+    #[test]
+    fn pick_effect_follows_preference_without_modifiers() {
+        let actions = [DndAction::Move, DndAction::Copy];
+        assert_eq!(pick_effect(&actions, 0, ALL), DROPEFFECT_MOVE);
+        let actions = [DndAction::Copy, DndAction::Move];
+        assert_eq!(pick_effect(&actions, 0, ALL), DROPEFFECT_COPY);
+    }
+
+    #[test]
+    fn pick_effect_honors_modifiers() {
+        let actions = [DndAction::Move, DndAction::Copy, DndAction::Link];
+        assert_eq!(pick_effect(&actions, MK_CONTROL, ALL), DROPEFFECT_COPY);
+        assert_eq!(pick_effect(&[DndAction::Copy, DndAction::Move], MK_SHIFT, ALL), DROPEFFECT_MOVE);
+        assert_eq!(pick_effect(&actions, MK_CONTROL | MK_SHIFT, ALL), DROPEFFECT_LINK);
+    }
+
+    #[test]
+    fn pick_effect_ignores_a_modifier_that_leaves_nothing() {
+        assert_eq!(pick_effect(&[DndAction::Move], MK_CONTROL, ALL), DROPEFFECT_MOVE);
+        assert_eq!(pick_effect(&[DndAction::Copy], MK_SHIFT, ALL), DROPEFFECT_COPY);
+    }
+
+    #[test]
+    fn pick_effect_respects_the_source() {
+        let actions = [DndAction::Move, DndAction::Copy];
+        assert_eq!(pick_effect(&actions, 0, DROPEFFECT_COPY), DROPEFFECT_COPY);
+        assert_eq!(pick_effect(&actions, 0, DROPEFFECT_NONE), DROPEFFECT_NONE);
+        assert_eq!(pick_effect(&[], 0, ALL), DROPEFFECT_NONE);
+        assert_eq!(pick_effect(&[DndAction::Ask], 0, ALL), DROPEFFECT_NONE);
+    }
+
+    #[test]
+    fn picked_effect_maps_back_to_the_action() {
+        let actions = [DndAction::Move, DndAction::Copy];
+        assert_eq!(
+            drop_effect_to_dnd_action(pick_effect(&actions, MK_CONTROL, ALL)),
+            Some(DndAction::Copy)
+        );
+        assert_eq!(drop_effect_to_dnd_action(pick_effect(&actions, 0, ALL)), Some(DndAction::Move));
+        assert_eq!(drop_effect_to_dnd_action(DROPEFFECT_NONE), None);
     }
 }

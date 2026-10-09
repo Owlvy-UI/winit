@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use winit_core::data_transfer::{DataTransfer, DataTransferId, TransferType, TypeHint, TypedData};
-use winit_core::event_loop::AsyncRequestSerial;
+use winit_core::event_loop::{AsyncRequestSerial, DndAction};
 use x11rb::protocol::xproto::{self, ConnectionExt};
 
 use crate::atoms::AtomName::None as DndNone;
@@ -15,10 +15,53 @@ use crate::event_loop::{CookieResultExt, X11Error};
 use crate::xdisplay::XConnection;
 use crate::{XWindow, util};
 
-#[derive(Debug, Clone, Copy)]
-pub enum DndState {
-    Accepted,
-    Rejected,
+/// The XDND action atoms that correspond to a [`DndAction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ActionAtoms {
+    copy: xproto::Atom,
+    move_: xproto::Atom,
+}
+
+impl ActionAtoms {
+    pub(crate) fn new(atoms: &Atoms) -> Self {
+        Self { copy: atoms[XdndActionCopy], move_: atoms[XdndActionMove] }
+    }
+
+    /// The action named by an XDND action atom, if it is one winit supports.
+    pub(crate) fn action(self, atom: xproto::Atom) -> Option<DndAction> {
+        if atom == self.copy {
+            Some(DndAction::Copy)
+        } else if atom == self.move_ {
+            Some(DndAction::Move)
+        } else {
+            None
+        }
+    }
+
+    /// The XDND action atom for an action, if XDND has one that winit supports.
+    pub(crate) fn atom(self, action: DndAction) -> Option<xproto::Atom> {
+        match action {
+            DndAction::Copy => Some(self.copy),
+            DndAction::Move => Some(self.move_),
+            _ => None,
+        }
+    }
+}
+
+/// Picks the action the target accepts.
+///
+/// `requested` is the action the source asked for in `XdndPosition`, `valid` the actions the
+/// application accepts. The requested action is taken when the application accepts it.
+/// Otherwise `Copy` is the fallback XDND allows a target to answer with.
+pub(crate) fn choose_action(
+    requested: Option<DndAction>,
+    valid: &[DndAction],
+) -> Option<DndAction> {
+    let supported = |action: DndAction| matches!(action, DndAction::Copy | DndAction::Move);
+    match requested {
+        Some(action) if supported(action) && valid.contains(&action) => Some(action),
+        _ => valid.contains(&DndAction::Copy).then_some(DndAction::Copy),
+    }
 }
 
 #[derive(Debug)]
@@ -115,10 +158,18 @@ pub struct DragState {
     // Populated by `fetch_data_transfer`
     pub pending_fetch_types: VecDeque<(AsyncRequestSerial, SelectionType)>,
     pub finished: Option<(XWindow, XWindow)>,
-    /// Whether the drag operation is accepted (or `None` if the user never indicated that it's
-    /// accepted or rejected)
-    // Populated by `Window::accept_drag`/`Window::reject_drag`.
-    pub accepted: bool,
+    /// The actions the application accepts, in order of preference.
+    // Populated by `set_valid_dnd_actions`.
+    pub valid_actions: Vec<DndAction>,
+    /// The action the source requested in the last `XdndPosition`.
+    pub requested_action: Option<DndAction>,
+}
+
+impl DragState {
+    /// The action the target currently accepts, `None` when the drag is rejected.
+    pub fn chosen_action(&self) -> Option<DndAction> {
+        choose_action(self.requested_action, &self.valid_actions)
+    }
 }
 
 impl Default for DragState {
@@ -133,7 +184,8 @@ impl Default for DragState {
             target_window: Default::default(),
             pending_fetch_types: Default::default(),
             finished: None,
-            accepted: Default::default(),
+            valid_actions: Vec::new(),
+            requested_action: None,
         }
     }
 }
@@ -259,7 +311,7 @@ impl Dnd {
         target_window: xproto::Window,
         types: Arc<[SelectionType]>,
     ) -> &DragState {
-        self.state.get_or_insert(DragState {
+        self.state.insert(DragState {
             version,
             types,
             source_window,
@@ -280,7 +332,10 @@ impl Dnd {
             ));
         };
         let (accepted, action) =
-            if state.accepted { (1, atoms[XdndActionCopy]) } else { (0, atoms[DndNone]) };
+            match state.chosen_action().and_then(|action| ActionAtoms::new(atoms).atom(action)) {
+                Some(action) => (1, action),
+                None => (0, atoms[DndNone]),
+            };
         self.xconn
             .send_client_msg(target_window, target_window, atoms[XdndFinished] as _, None, [
                 this_window,
@@ -325,13 +380,14 @@ impl Dnd {
         &self,
         this_window: xproto::Window,
         target_window: xproto::Window,
-        status: DndState,
+        action: Option<DndAction>,
     ) -> Result<(), X11Error> {
         let atoms = self.xconn.atoms();
-        let (accepted, action) = match status {
-            DndState::Accepted => (1, atoms[XdndActionCopy]),
-            DndState::Rejected => (0, atoms[DndNone]),
-        };
+        let (accepted, action) =
+            match action.and_then(|action| ActionAtoms::new(atoms).atom(action)) {
+                Some(action) => (1, action),
+                None => (0, atoms[DndNone]),
+            };
         self.xconn
             .send_client_msg(target_window, target_window, atoms[XdndStatus] as _, None, [
                 this_window,
@@ -355,5 +411,67 @@ impl Dnd {
         let bytes = self.xconn.get_property(window, atoms[XdndSelection], type_atom)?;
 
         Ok(SelectionReader { type_, data: bytes })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use winit_core::event_loop::DndAction;
+
+    use super::{ActionAtoms, choose_action};
+
+    const ATOMS: ActionAtoms = ActionAtoms { copy: 10, move_: 11 };
+
+    #[test]
+    fn atoms_map_to_actions() {
+        assert_eq!(ATOMS.action(10), Some(DndAction::Copy));
+        assert_eq!(ATOMS.action(11), Some(DndAction::Move));
+        assert_eq!(ATOMS.action(0), None);
+        assert_eq!(ATOMS.action(12), None);
+    }
+
+    #[test]
+    fn actions_map_to_atoms() {
+        assert_eq!(ATOMS.atom(DndAction::Copy), Some(10));
+        assert_eq!(ATOMS.atom(DndAction::Move), Some(11));
+        assert_eq!(ATOMS.atom(DndAction::Link), None);
+        assert_eq!(ATOMS.atom(DndAction::Ask), None);
+        assert_eq!(ATOMS.atom(DndAction::Private), None);
+    }
+
+    #[test]
+    fn mapping_round_trips() {
+        for action in [DndAction::Copy, DndAction::Move] {
+            assert_eq!(ATOMS.atom(action).and_then(|atom| ATOMS.action(atom)), Some(action));
+        }
+    }
+
+    #[test]
+    fn requested_action_wins_when_valid() {
+        let valid = [DndAction::Copy, DndAction::Move];
+        assert_eq!(choose_action(Some(DndAction::Move), &valid), Some(DndAction::Move));
+        assert_eq!(choose_action(Some(DndAction::Copy), &valid), Some(DndAction::Copy));
+    }
+
+    #[test]
+    fn preference_order_does_not_override_the_source() {
+        let valid = [DndAction::Move, DndAction::Copy];
+        assert_eq!(choose_action(Some(DndAction::Copy), &valid), Some(DndAction::Copy));
+    }
+
+    #[test]
+    fn falls_back_to_copy() {
+        assert_eq!(choose_action(Some(DndAction::Move), &[DndAction::Copy]), Some(DndAction::Copy));
+        assert_eq!(choose_action(None, &[DndAction::Move, DndAction::Copy]), Some(DndAction::Copy));
+        assert_eq!(choose_action(Some(DndAction::Link), &[DndAction::Copy]), Some(DndAction::Copy));
+    }
+
+    #[test]
+    fn rejects_without_a_match() {
+        assert_eq!(choose_action(Some(DndAction::Move), &[]), None);
+        assert_eq!(choose_action(None, &[]), None);
+        assert_eq!(choose_action(Some(DndAction::Copy), &[DndAction::Move]), None);
+        assert_eq!(choose_action(None, &[DndAction::Move]), None);
+        assert_eq!(choose_action(Some(DndAction::Link), &[DndAction::Link]), None);
     }
 }

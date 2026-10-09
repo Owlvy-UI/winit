@@ -40,6 +40,7 @@ pub(super) struct PendingDrag {
     pub(super) drop_source: DropSource,
     pub(super) allowed_effects: DropEffect,
     pub(super) id: DataTransferId,
+    pub(super) actions: Vec<DndAction>,
 }
 
 /// Set while `DoDragDrop` is on the call stack - i.e., this process is the source of an active
@@ -74,6 +75,9 @@ pub(crate) struct EventLoopRunner {
 
     /// `Some(_)` while `start_drag` has `DoDragDrop` on the call stack.
     pub(crate) source_drag: Cell<Option<SourceDrag>>,
+
+    /// The actions passed to `start_drag` for the drag in `source_drag`, in order of preference.
+    source_drag_actions: RefCell<Vec<DndAction>>,
 
     /// `DoDragDrop` is blocking and synchronous, so we wait until after the application returns
     /// control to winit before actually calling into the OS to initiate the drag. This prevents
@@ -143,13 +147,14 @@ impl EventLoopRunner {
             event_buffer: RefCell::new(VecDeque::new()),
             drag_state: RefCell::new(None),
             source_drag: Cell::new(None),
+            source_drag_actions: RefCell::new(Vec::new()),
             pending_drag: RefCell::new(None),
             pending_source_drag_cleanup: Cell::new(None),
         }
     }
 
     pub(super) fn try_execute_drag_drop(self: &Rc<Self>) {
-        let Some(PendingDrag { data_object, drop_source, id, allowed_effects, window_id }) =
+        let Some(PendingDrag { data_object, drop_source, id, allowed_effects, window_id, actions }) =
             self.pending_drag.take()
         else {
             return;
@@ -167,6 +172,7 @@ impl EventLoopRunner {
             }
         }
         self.source_drag.set(Some(SourceDrag { id }));
+        self.source_drag_actions.replace(actions);
         let _guard = ClearOnDrop(&self.source_drag);
 
         let mut effect_out: u32 = DROPEFFECT_NONE;
@@ -240,21 +246,12 @@ impl EventLoopRunner {
         })
     }
 
-    pub(crate) fn proposed_dnd_action(
-        &self,
-        id: DataTransferId,
-        effects: DropEffect,
-    ) -> Option<DndAction> {
-        self.current_drag_actions(id).iter().copied().find(|action| {
-            let effect = match action {
-                DndAction::Move => DROPEFFECT_MOVE,
-                DndAction::Copy => DROPEFFECT_COPY,
-                DndAction::Link => DROPEFFECT_LINK,
-                _ => return false,
-            };
-
-            (effects & effect) != 0
-        })
+    /// Makes the actions passed to `start_drag` the valid actions of the transfer `id`.
+    pub(crate) fn seed_source_drag_actions(&self, id: DataTransferId) {
+        let actions = self.source_drag_actions.borrow();
+        if let Some(state) = self.drag_state.borrow_mut().as_mut().filter(|s| s.id == id) {
+            state.actions.clone_from(&actions);
+        }
     }
 
     /// Associate the application's event handler with the runner.
@@ -307,6 +304,7 @@ impl EventLoopRunner {
             event_buffer: _,
             drag_state,
             source_drag,
+            source_drag_actions,
             pending_drag,
             pending_source_drag_cleanup,
         } = self;
@@ -317,6 +315,7 @@ impl EventLoopRunner {
         event_handler.set(None);
         drag_state.take();
         source_drag.set(None);
+        source_drag_actions.take();
         pending_drag.take();
         pending_source_drag_cleanup.set(None);
     }

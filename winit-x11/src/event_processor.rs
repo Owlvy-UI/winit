@@ -34,7 +34,7 @@ use x11rb::x11_utils::{ExtensionInformation, Serialize};
 use xkbcommon_dl::xkb_mod_mask_t;
 
 use crate::atoms::*;
-use crate::dnd::{DndState, SelectionType};
+use crate::dnd::{ActionAtoms, SelectionType};
 use crate::event_loop::{
     ALL_DEVICES, ActiveEventLoop, CookieResultExt, Device, DeviceInfo, DeviceType,
     ScrollOrientation, mkdid, mkwid,
@@ -493,8 +493,21 @@ impl EventProcessor {
 
             // Cautiously limit the scope of the `dnd` lock so we don't rely on `app.window_event`
             // never contending the lock.
-            let transfer_id = {
-                let dnd = self.target.dnd.borrow();
+            let (transfer_id, proposed_action) = {
+                let mut dnd = self.target.dnd.borrow_mut();
+                let Some(state) = dnd.state_mut() else {
+                    return;
+                };
+                // The requested action is in `data.l[4]` from version 2 on, and is
+                // always copy before that.
+                state.requested_action = if state.version >= 2 {
+                    xproto::Atom::try_from(xev.data.get_long(4))
+                        .ok()
+                        .and_then(|atom| ActionAtoms::new(atoms).action(atom))
+                } else {
+                    Some(DndAction::Copy)
+                };
+                let proposed_action = state.chosen_action();
                 let Some(state) = dnd.state() else {
                     return;
                 };
@@ -512,33 +525,24 @@ impl EventProcessor {
                 self.target.xconn.set_timestamp(time);
 
                 unsafe {
-                    dnd.send_status(
-                        window,
-                        source_window,
-                        if state.accepted { DndState::Accepted } else { DndState::Rejected },
-                    )
-                    .expect("Failed to send `XdndStatus` message.");
+                    dnd.send_status(window, source_window, proposed_action)
+                        .expect("Failed to send `XdndStatus` message.");
                 }
 
-                state.transfer_id
+                (state.transfer_id, proposed_action)
             };
 
             app.window_event(&self.target, window_id, WindowEvent::DragPosition {
                 id: transfer_id,
                 position: PhysicalPosition::new(coords.dst_x as f64, coords.dst_y as f64),
-                // `Copy` is the default. Other actions are possible in X11, but the specification
-                // does not properly explain how to implement them (only giving a vague description
-                // of `XdndMove`). For simplicity's sake, we simply do not implement non-copy drag
-                // on X11.
-                // See https://www.freedesktop.org/wiki/Specifications/XDND/
-                proposed_action: Some(DndAction::Copy),
+                proposed_action,
             });
 
             return;
         }
 
         if xev.message_type == atoms[XdndDrop] as c_ulong {
-            let (source_window, transfer_id) = {
+            let (source_window, transfer_id, proposed_action) = {
                 let dnd = self.target.dnd.borrow();
                 let Some(state) = dnd.state() else {
                     warn!("Received `XdndDrop` without `XdndEnter`");
@@ -546,24 +550,18 @@ impl EventProcessor {
                 };
                 let source_window = state.source_window;
 
-                (source_window, state.transfer_id)
+                (source_window, state.transfer_id, state.chosen_action())
             };
 
-            app.window_event(
-                &self.target,
-                window_id,
-                // TODO
-                WindowEvent::DragDropped {
-                    id: transfer_id,
-                    // `Copy` is the default. Other actions are possible in X11, but the
-                    // specification does not properly explain how to implement
-                    // them (only giving a vague description of `XdndMove`). For
-                    // simplicity's sake, we simply do not implement non-copy drag
-                    // on X11.
-                    // See https://www.freedesktop.org/wiki/Specifications/XDND/
-                    proposed_action: Some(DndAction::Copy),
+            // A rejected drop ends like a drag that left, and `XdndFinished` reports it as
+            // not accepted.
+            let event = match proposed_action {
+                Some(action) => {
+                    WindowEvent::DragDropped { id: transfer_id, proposed_action: Some(action) }
                 },
-            );
+                None => WindowEvent::DragLeft { id: transfer_id },
+            };
+            app.window_event(&self.target, window_id, event);
 
             let mut dnd = self.target.dnd.borrow_mut();
 

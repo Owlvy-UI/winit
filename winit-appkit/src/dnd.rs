@@ -216,10 +216,30 @@ pub fn preferred_drag_operation(
     value: NSDragOperation,
     preference: &[DndAction],
 ) -> Option<DndAction> {
+    preference.iter().find(|action| drag_operation_for(value, **action).is_some()).copied()
+}
+
+/// The operation to return to AppKit for the first action in `preference` that the source
+/// mask `value` allows, or an empty operation when there is none.
+pub fn accepted_drag_operation(value: NSDragOperation, preference: &[DndAction]) -> NSDragOperation {
     preference
         .iter()
-        .find(|action| value.intersects(dnd_action_to_ns_drag_operation(**action)))
-        .copied()
+        .find_map(|action| drag_operation_for(value, *action))
+        .unwrap_or(NSDragOperation::empty())
+}
+
+/// The operation in the source mask `value` that performs `action`.
+///
+/// Holding Command reduces the mask to `Generic`, which stands for a move.
+fn drag_operation_for(value: NSDragOperation, action: DndAction) -> Option<NSDragOperation> {
+    let operation = dnd_action_to_ns_drag_operation(action);
+    if value.intersects(operation) {
+        Some(operation)
+    } else if action == DndAction::Move && value.contains(NSDragOperation::Generic) {
+        Some(NSDragOperation::Generic)
+    } else {
+        None
+    }
 }
 
 /// A thin wrapper around [`NSPasteboard`], implementing [`TypedData`].
@@ -498,3 +518,51 @@ define_class!(
         }
     }
 );
+
+#[cfg(test)]
+mod tests {
+    use objc2_app_kit::NSDragOperation;
+    use winit_core::event_loop::DndAction;
+
+    use super::{accepted_drag_operation, preferred_drag_operation};
+
+    const MOVE_COPY: [DndAction; 2] = [DndAction::Move, DndAction::Copy];
+
+    #[test]
+    fn preference_order_is_kept() {
+        let all = NSDragOperation::Copy | NSDragOperation::Move | NSDragOperation::Generic;
+        assert_eq!(preferred_drag_operation(all, &MOVE_COPY), Some(DndAction::Move));
+        assert_eq!(accepted_drag_operation(all, &MOVE_COPY), NSDragOperation::Move);
+        let copy_move = [DndAction::Copy, DndAction::Move];
+        assert_eq!(accepted_drag_operation(all, &copy_move), NSDragOperation::Copy);
+    }
+
+    #[test]
+    fn option_selects_copy() {
+        let mask = NSDragOperation::Copy;
+        assert_eq!(preferred_drag_operation(mask, &MOVE_COPY), Some(DndAction::Copy));
+        assert_eq!(accepted_drag_operation(mask, &MOVE_COPY), NSDragOperation::Copy);
+    }
+
+    #[test]
+    fn command_selects_move_through_generic() {
+        let mask = NSDragOperation::Generic;
+        assert_eq!(preferred_drag_operation(mask, &MOVE_COPY), Some(DndAction::Move));
+        assert_eq!(accepted_drag_operation(mask, &MOVE_COPY), NSDragOperation::Generic);
+        assert_eq!(preferred_drag_operation(mask, &[DndAction::Copy]), None);
+    }
+
+    #[test]
+    fn nothing_matches() {
+        assert_eq!(preferred_drag_operation(NSDragOperation::empty(), &MOVE_COPY), None);
+        assert_eq!(
+            accepted_drag_operation(NSDragOperation::empty(), &MOVE_COPY),
+            NSDragOperation::empty()
+        );
+        assert_eq!(accepted_drag_operation(NSDragOperation::Move, &[]), NSDragOperation::empty());
+        assert_eq!(
+            accepted_drag_operation(NSDragOperation::Move, &[DndAction::Ask]),
+            NSDragOperation::empty()
+        );
+    }
+}

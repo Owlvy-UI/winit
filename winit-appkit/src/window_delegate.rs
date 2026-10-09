@@ -69,9 +69,7 @@ use super::util::cgerr;
 use super::view::WinitView;
 use super::window::{WinitPanel, WinitWindow, window_id};
 use crate::app_state::DragState;
-use crate::dnd::{
-    dnd_action_to_ns_drag_operation, ns_drag_operation_to_dnd_action, preferred_drag_operation,
-};
+use crate::dnd::{accepted_drag_operation, ns_drag_operation_to_dnd_action};
 use crate::{BlurMaterial, OptionAsAlt, WindowAttributesMacOS, WindowExtMacOS};
 
 #[derive(Debug)]
@@ -459,10 +457,9 @@ define_class!(
 
             drag_state
                 .as_ref()
-                .and_then(|drag_state| {
-                    preferred_drag_operation(source_operations, &drag_state.valid_actions)
+                .map(|drag_state| {
+                    accepted_drag_operation(source_operations, &drag_state.valid_actions)
                 })
-                .map(dnd_action_to_ns_drag_operation)
                 .unwrap_or(NSDragOperation::empty())
         }
 
@@ -510,10 +507,9 @@ define_class!(
 
             drag_state
                 .as_ref()
-                .and_then(|drag_state| {
-                    preferred_drag_operation(source_operations, &drag_state.valid_actions)
+                .map(|drag_state| {
+                    accepted_drag_operation(source_operations, &drag_state.valid_actions)
                 })
-                .map(dnd_action_to_ns_drag_operation)
                 .unwrap_or(NSDragOperation::empty())
         }
 

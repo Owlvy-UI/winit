@@ -89,6 +89,7 @@ atom_manager! {
     XdndPosition,
     XdndStatus,
     XdndActionCopy,
+    XdndActionMove,
     XdndSelection,
     XdndFinished,
     XdndTypeList,

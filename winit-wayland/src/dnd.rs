@@ -123,24 +123,11 @@ impl DataSourceHandler for WinitState {
         let id = current_drag.data_transfer_id;
 
         self.events_sink.push_window_event(WindowEvent::OutgoingDragCanceled { id }, window_id);
+        self.dnd_state.clear_send_drag();
     }
 
     fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {
-        let Some(current_drag) = self.dnd_state.send_drag() else {
-            return;
-        };
-
-        let window_id = current_drag.window_id;
-        let id = current_drag.data_transfer_id;
-        let selected_action = current_drag.selected_action;
-
-        self.events_sink.push_window_event(
-            WindowEvent::OutgoingDragDropped {
-                id,
-                action: dnd_action_wl_to_winit(selected_action),
-            },
-            window_id,
-        );
+        // The outcome is reported on `dnd_finished` or `cancelled`.
     }
 
     fn dnd_finished(
@@ -149,6 +136,16 @@ impl DataSourceHandler for WinitState {
         _: &QueueHandle<Self>,
         _: &wayland_client::protocol::wl_data_source::WlDataSource,
     ) {
+        if let Some(current_drag) = self.dnd_state.send_drag() {
+            self.events_sink.push_window_event(
+                WindowEvent::OutgoingDragDropped {
+                    id: current_drag.data_transfer_id,
+                    action: dnd_action_wl_to_winit(current_drag.selected_action),
+                },
+                current_drag.window_id,
+            );
+        }
+
         self.dnd_state.clear_send_drag();
     }
 
@@ -449,6 +446,14 @@ pub(crate) fn dnd_action_wl_to_winit(wl: WlDndAction) -> Option<DndAction> {
     }
 }
 
+/// Whether a dropped offer with this selected action may be finished.
+///
+/// `wl_data_offer.finish` is only valid for a final copy or move. `ask` still awaits a last
+/// `set_actions`, and without an action the drop was not accepted.
+pub(crate) fn finishes_drop(selected_action: WlDndAction) -> bool {
+    selected_action == WlDndAction::Copy || selected_action == WlDndAction::Move
+}
+
 impl DataOffer {
     pub(crate) fn transfer_id(&self) -> DataTransferId {
         make_data_transfer_id(self.data_device_id.clone(), self.serial)
@@ -688,9 +693,8 @@ impl DataDeviceHandler for WinitState {
                 current_drag.window_id(),
             );
 
-            if let Some(receive_drag) = self.dnd_state.receive_drag.take() {
-                receive_drag.finish();
-            }
+            // An offer that was not dropped is only destroyed, never finished.
+            self.dnd_state.receive_drag = None;
         }
 
         if let Some(drag) = data.drag_offer() {
@@ -791,7 +795,9 @@ impl DataDeviceHandler for WinitState {
         );
 
         if let Some(receive_drag) = self.dnd_state.receive_drag.take() {
-            receive_drag.finish();
+            if receive_drag.version() >= 3 && finishes_drop(drag.selected_action) {
+                receive_drag.finish();
+            }
         }
 
         if let Some(drag) = data.drag_offer() {
@@ -800,5 +806,26 @@ impl DataDeviceHandler for WinitState {
         if let Some(selection) = data.selection_offer() {
             selection.destroy();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wayland_client::protocol::wl_data_device_manager::DndAction as WlDndAction;
+
+    use super::finishes_drop;
+
+    #[test]
+    fn copy_and_move_finish() {
+        assert!(finishes_drop(WlDndAction::Copy));
+        assert!(finishes_drop(WlDndAction::Move));
+    }
+
+    #[test]
+    fn other_actions_do_not_finish() {
+        assert!(!finishes_drop(WlDndAction::None));
+        assert!(!finishes_drop(WlDndAction::empty()));
+        assert!(!finishes_drop(WlDndAction::Ask));
+        assert!(!finishes_drop(WlDndAction::Copy | WlDndAction::Move));
     }
 }

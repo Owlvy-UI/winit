@@ -378,6 +378,7 @@ pub enum DndAction {
     ///
     /// # Platforms
     ///
+    /// - X11 (receiving only)
     /// - Wayland
     /// - macOS
     /// - Windows
