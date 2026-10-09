@@ -336,6 +336,14 @@ impl EventLoop {
                     MotionAction::Move | MotionAction::Cancel => {
                         Some(Box::new(motion_event.pointers()))
                     },
+                    MotionAction::HoverEnter
+                    | MotionAction::HoverMove
+                    | MotionAction::HoverExit => {
+                        // Hover reaches the view hierarchy, where accessibility
+                        // turns it into the node under the pointer.
+                        input_status = InputStatus::Unhandled;
+                        None
+                    },
                     // TODO mouse events
                     _ => None,
                 };
