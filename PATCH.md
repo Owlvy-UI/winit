@@ -72,9 +72,18 @@ feature of `x11rb`):
   state machine, message packing, version and proxy checks, action choice,
   timeouts, `INCR` pieces, text and URI list encoding, icon pixels. It is unit
   tested.
-- `start_drag` takes `XdndSelection`, sets `XdndTypeList`, grabs pointer and
-  keyboard on the source window and shows the `no-drop`, `copy` or `move`
-  cursor for the current answer of the target.
+- `start_drag` takes `XdndSelection`, sets `XdndTypeList`, grabs the client
+  pointer and its paired master keyboard on the source window with
+  `XIGrabDevice` and shows the `no-drop`, `copy` or `move` cursor for the
+  current answer of the target (a new `XIGrabDevice` with the other cursor).
+  A core `GrabPointer` fails with `AlreadyGrabbed` because the button press
+  that starts the drag holds an implicit XI2 grab. Every end of the drag calls
+  `XIUngrabDevice` for both devices.
+- XI2 motion, button and key events on the grab window go to the drag
+  (`EventProcessor::drag_grab_event`) and never reach the application as
+  `PointerMoved`, `PointerButton` or key input. XI2 enter, leave and focus
+  events of the grab (mode `Grab`, and `Ungrab` up to one second after the
+  drag) are dropped as well. Position and modifiers come from `QueryPointer`.
 - Targets are found by descending from the root window to the first window
   with `XdndAware`, honouring a valid `XdndProxy`. Versions 3 to 5 are spoken.
 - `XdndPosition` waits for the previous `XdndStatus` and is skipped inside the

@@ -227,6 +227,10 @@ impl EventProcessor {
 
                 let evtype = xev.evtype();
 
+                if self.drag_grab_event(&xev, evtype, app) {
+                    return;
+                }
+
                 match evtype {
                     ty @ xinput2::XI_ButtonPress | ty @ xinput2::XI_ButtonRelease => {
                         let state = if ty == xinput2::XI_ButtonPress {
@@ -306,6 +310,41 @@ impl EventProcessor {
                     self.process_dpi_change(app);
                 }
             },
+        }
+    }
+
+    /// Hands XI2 events of the drag grab to the drag source, `true` when they are consumed.
+    fn drag_grab_event(
+        &self,
+        xev: &GenericEventCookie,
+        evtype: c_int,
+        app: &mut dyn ApplicationHandler,
+    ) -> bool {
+        match evtype {
+            xinput2::XI_Motion
+            | xinput2::XI_ButtonPress
+            | xinput2::XI_ButtonRelease
+            | xinput2::XI_KeyPress
+            | xinput2::XI_KeyRelease => {
+                // SAFETY: These event types carry an `XIDeviceEvent`.
+                let event: &XIDeviceEvent = unsafe { xev.as_event() };
+                match self.target.drag_device_event(evtype, event) {
+                    Handled::No => false,
+                    Handled::Consumed(event) | Handled::Observed(event) => {
+                        if let Some((window_id, event)) = event {
+                            app.window_event(&self.target, window_id, event);
+                        }
+
+                        true
+                    },
+                }
+            },
+            xinput2::XI_Enter | xinput2::XI_Leave | xinput2::XI_FocusIn | xinput2::XI_FocusOut => {
+                // SAFETY: These event types carry an `XIEnterEvent`.
+                let event: &XIEnterEvent = unsafe { xev.as_event() };
+                self.target.drag_crossing_event(event)
+            },
+            _ => false,
         }
     }
 

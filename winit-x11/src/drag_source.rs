@@ -13,7 +13,9 @@ use winit_core::icon::RgbaIcon;
 use winit_core::window::WindowId;
 use x11_dl::xlib;
 use x11rb::connection::{Connection, RequestConnection};
+use x11_dl::xinput2;
 use x11rb::protocol::shape::{self, ConnectionExt as _};
+use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
 
 use crate::atoms::{
@@ -24,8 +26,8 @@ use crate::atoms::{
 use crate::dnd::{ActionAtoms, SelectionType, next_transfer_id};
 use crate::event_loop::{ActiveEventLoop, X11Error, mkwid};
 use crate::xdnd_source::{
-    self, Feedback, Finished, FinishedData, Incr, Machine, Message, Outcome, Output, Pointer,
-    Status, StatusData, Target,
+    self, EndedGrab, Feedback, Finished, FinishedData, Incr, Machine, Message, Outcome, Output,
+    Pointer, Status, StatusData, Target,
 };
 
 /// The deepest window nesting searched for a target.
@@ -43,11 +45,25 @@ const REQUEST_HEADER: usize = 64;
 /// The keysym of Escape.
 const ESCAPE_KEYSYM: u32 = 0xff1b;
 
-/// The pointer events of the drag grab.
-fn grab_events() -> xproto::EventMask {
-    xproto::EventMask::BUTTON_PRESS
-        | xproto::EventMask::BUTTON_RELEASE
-        | xproto::EventMask::POINTER_MOTION
+/// The XI2 events of the pointer grab.
+fn pointer_grab_events() -> u32 {
+    u32::from(
+        xinput::XIEventMask::MOTION
+            | xinput::XIEventMask::BUTTON_PRESS
+            | xinput::XIEventMask::BUTTON_RELEASE,
+    )
+}
+
+/// The XI2 events of the keyboard grab.
+fn keyboard_grab_events() -> u32 {
+    u32::from(xinput::XIEventMask::KEY_PRESS | xinput::XIEventMask::KEY_RELEASE)
+}
+
+/// The master devices grabbed for a drag.
+#[derive(Debug, Clone, Copy)]
+struct Grab {
+    pointer: xinput::DeviceId,
+    keyboard: Option<xinput::DeviceId>,
 }
 
 /// An event for the application, addressed to a window.
@@ -68,12 +84,14 @@ pub(crate) enum Handled {
 pub(crate) struct DragSources {
     drag: Option<OutgoingDrag>,
     incr: Vec<Incr>,
+    ended_grab: Option<EndedGrab>,
 }
 
 #[derive(Debug)]
 struct OutgoingDrag {
     id: DataTransferId,
     window: xproto::Window,
+    grab: Grab,
     machine: Machine,
     send_data: Box<dyn DataTransferSend>,
     types: Vec<SelectionType>,
@@ -105,14 +123,6 @@ fn window_from(value: c_ulong) -> Option<u32> {
 
 fn time_from(value: c_ulong) -> u32 {
     u32::try_from(value & 0xffff_ffff).unwrap_or_default()
-}
-
-fn coordinate(value: c_int) -> i16 {
-    i16::try_from(value).unwrap_or(if value < 0 { i16::MIN } else { i16::MAX })
-}
-
-fn mask_from(state: std::os::raw::c_uint) -> u16 {
-    u16::try_from(state & 0xffff).unwrap_or_default()
 }
 
 impl ActiveEventLoop {
@@ -158,10 +168,13 @@ impl ActiveEventLoop {
         }
 
         let owned_since = self.take_selection(window, &types).map_err(|err| os_error!(err))?;
-        if let Err(err) = self.grab_for_drag(window) {
-            self.release_selection(window, owned_since);
-            return Err(os_error!(err).into());
-        }
+        let grab = match self.grab_for_drag(window) {
+            Ok(grab) => grab,
+            Err(err) => {
+                self.release_selection(window, owned_since);
+                return Err(os_error!(err).into());
+            },
+        };
 
         let escape = self.escape_keycodes().unwrap_or_else(|err| {
             warn!("Escape cannot cancel the drag, the keyboard mapping is unavailable: {err}");
@@ -179,6 +192,7 @@ impl ActiveEventLoop {
         let mut drag = OutgoingDrag {
             id,
             window,
+            grab,
             machine: Machine::new(allowed),
             send_data,
             types,
@@ -245,40 +259,85 @@ impl ActiveEventLoop {
         }
     }
 
-    /// Grabs pointer and keyboard on `window` for the drag.
-    fn grab_for_drag(&self, window: xproto::Window) -> Result<(), X11Error> {
+    /// Grabs the client pointer and its paired keyboard on `window` with XI2 for the drag.
+    fn grab_for_drag(&self, window: xproto::Window) -> Result<Grab, X11Error> {
         let conn = self.xconn.xcb_connection();
-        let cursor = self.feedback_cursor(Feedback::NoDrop);
-        let pointer = conn
-            .grab_pointer(
-                false,
+        let pointer = conn.xinput_xi_get_client_pointer(window)?.reply()?.deviceid;
+        if !self.grab_device(window, pointer, Feedback::NoDrop)? {
+            return Err(X11Error::DragStart("the XI2 pointer grab failed"));
+        }
+
+        let keyboard = match self.grab_keyboard(window, pointer) {
+            Ok(Some(keyboard)) => Some(keyboard),
+            Ok(None) => {
+                warn!("Escape cannot cancel the drag, the keyboard grab was refused");
+                None
+            },
+            Err(err) => {
+                warn!("Escape cannot cancel the drag, the keyboard grab failed: {err}");
+                None
+            },
+        };
+
+        Ok(Grab { pointer, keyboard })
+    }
+
+    /// Grabs `pointer` on `window` showing the cursor for `feedback`, `false` when refused.
+    fn grab_device(
+        &self,
+        window: xproto::Window,
+        pointer: xinput::DeviceId,
+        feedback: Feedback,
+    ) -> Result<bool, X11Error> {
+        let reply = self
+            .xconn
+            .xcb_connection()
+            .xinput_xi_grab_device(
                 window,
-                grab_events(),
+                x11rb::CURRENT_TIME,
+                self.feedback_cursor(feedback),
+                pointer,
                 xproto::GrabMode::ASYNC,
                 xproto::GrabMode::ASYNC,
+                xinput::GrabOwner::NO_OWNER,
+                &[pointer_grab_events()],
+            )?
+            .reply()?;
+        Ok(reply.status == xproto::GrabStatus::SUCCESS)
+    }
+
+    /// Grabs the master keyboard paired with `pointer` on `window`.
+    fn grab_keyboard(
+        &self,
+        window: xproto::Window,
+        pointer: xinput::DeviceId,
+    ) -> Result<Option<xinput::DeviceId>, X11Error> {
+        let conn = self.xconn.xcb_connection();
+        let devices = conn.xinput_xi_query_device(pointer)?.reply()?;
+        let Some(keyboard) = devices
+            .infos
+            .iter()
+            .find(|info| {
+                info.deviceid == pointer && info.type_ == xinput::DeviceType::MASTER_POINTER
+            })
+            .map(|info| info.attachment)
+        else {
+            return Ok(None);
+        };
+
+        let reply = conn
+            .xinput_xi_grab_device(
+                window,
+                x11rb::CURRENT_TIME,
                 x11rb::NONE,
-                cursor,
-                x11rb::CURRENT_TIME,
-            )?
-            .reply()?;
-        if pointer.status != xproto::GrabStatus::SUCCESS {
-            return Err(X11Error::DragStart("the pointer grab failed"));
-        }
-
-        let keyboard = conn
-            .grab_keyboard(
-                false,
-                window,
-                x11rb::CURRENT_TIME,
+                keyboard,
                 xproto::GrabMode::ASYNC,
                 xproto::GrabMode::ASYNC,
+                xinput::GrabOwner::NO_OWNER,
+                &[keyboard_grab_events()],
             )?
             .reply()?;
-        if keyboard.status != xproto::GrabStatus::SUCCESS {
-            warn!("Escape cannot cancel the drag, the keyboard grab failed");
-        }
-
-        Ok(())
+        Ok((reply.status == xproto::GrabStatus::SUCCESS).then_some(keyboard))
     }
 
     fn feedback_cursor(&self, feedback: Feedback) -> xproto::Cursor {
@@ -631,14 +690,9 @@ impl ActiveEventLoop {
             match output {
                 Output::Send(target, message) => self.send_message(drag, target, message),
                 Output::Cursor(feedback) => {
-                    let cursor = self.feedback_cursor(feedback);
-                    let changed = self.xconn.xcb_connection().change_active_pointer_grab(
-                        cursor,
-                        x11rb::CURRENT_TIME,
-                        grab_events(),
-                    );
-                    match changed {
-                        Ok(cookie) => cookie.ignore_error(),
+                    match self.grab_device(drag.window, drag.grab.pointer, feedback) {
+                        Ok(true) => {},
+                        Ok(false) => warn!("The pointer grab refused the new drag cursor"),
                         Err(err) => warn!("Failed to change the drag cursor: {err}"),
                     }
                 },
@@ -659,16 +713,17 @@ impl ActiveEventLoop {
     /// Releases everything an ended drag holds.
     fn end_drag(&self, drag: &OutgoingDrag) {
         let conn = self.xconn.xcb_connection();
-        let results = [
-            conn.ungrab_pointer(x11rb::CURRENT_TIME),
-            conn.ungrab_keyboard(x11rb::CURRENT_TIME),
-            conn.delete_property(drag.window, self.xconn.atoms()[XdndTypeList]),
-        ];
-        for result in results {
-            match result {
+        let devices = std::iter::once(drag.grab.pointer).chain(drag.grab.keyboard);
+        for device in devices {
+            match conn.xinput_xi_ungrab_device(x11rb::CURRENT_TIME, device) {
                 Ok(cookie) => cookie.ignore_error(),
-                Err(err) => warn!("Failed to clean up after the drag: {err}"),
+                Err(err) => warn!("Failed to release the drag grab of device {device}: {err}"),
             }
+        }
+
+        match conn.delete_property(drag.window, self.xconn.atoms()[XdndTypeList]) {
+            Ok(cookie) => cookie.ignore_error(),
+            Err(err) => warn!("Failed to delete XdndTypeList after the drag: {err}"),
         }
 
         if let Some(icon) = drag.icon {
@@ -699,6 +754,8 @@ impl ActiveEventLoop {
         if drag.machine.is_done() {
             if let Some(drag) = sources.drag.take() {
                 self.end_drag(&drag);
+                let until = xdnd_source::after(Instant::now(), xdnd_source::UNGRAB_TIMEOUT);
+                sources.ended_grab = Some(EndedGrab { window: drag.window, until });
             }
         }
 
@@ -751,17 +808,6 @@ impl ActiveEventLoop {
     /// Hands an X event to the drag source.
     pub(crate) fn drag_event(&self, xev: &xlib::XEvent) -> Handled {
         match xev.get_type() {
-            xlib::MotionNotify => self.drag_motion(xev.as_ref()),
-            xlib::ButtonPress => {
-                let event: &xlib::XButtonEvent = xev.as_ref();
-                if self.is_drag_window(window_from(event.window)) {
-                    Handled::Consumed(None)
-                } else {
-                    Handled::No
-                }
-            },
-            xlib::ButtonRelease => self.drag_release(xev.as_ref()),
-            xlib::KeyPress | xlib::KeyRelease => self.drag_key(xev.as_ref()),
             xlib::ClientMessage => self.drag_client_message(xev.as_ref()),
             xlib::SelectionRequest => self.selection_request(xev.as_ref()),
             xlib::SelectionClear => self.selection_clear(xev.as_ref()),
@@ -786,52 +832,63 @@ impl ActiveEventLoop {
         Handled::Observed(self.with_drag(|_, drag| drag.machine.cancel()))
     }
 
-    fn drag_motion(&self, event: &xlib::XMotionEvent) -> Handled {
-        if !self.is_drag_window(window_from(event.window)) {
+    /// Hands an XI2 device event of the drag grab to the drag source.
+    ///
+    /// Motion, button and key events on the grab window are consumed while a drag runs.
+    pub(crate) fn drag_device_event(
+        &self,
+        evtype: c_int,
+        event: &xinput2::XIDeviceEvent,
+    ) -> Handled {
+        if !self.is_drag_window(window_from(event.event)) {
             return Handled::No;
         }
 
         let time = time_from(event.time);
         self.xconn.set_timestamp(time);
-        let (x, y) = (coordinate(event.x_root), coordinate(event.y_root));
-        let mask = mask_from(event.state);
-        Handled::Consumed(
-            self.with_drag(|this, drag| this.pointer_moved(drag, x, y, mask, time)),
-        )
+        match evtype {
+            xinput2::XI_Motion => {
+                Handled::Consumed(self.with_drag(|this, drag| this.pointer_update(drag, time)))
+            },
+            xinput2::XI_ButtonPress => Handled::Consumed(None),
+            xinput2::XI_ButtonRelease => Handled::Consumed(
+                self.with_drag(|_, drag| drag.machine.release(Instant::now(), time)),
+            ),
+            xinput2::XI_KeyPress | xinput2::XI_KeyRelease => {
+                let keycode = u8::try_from(event.detail).ok();
+                let pressed = evtype == xinput2::XI_KeyPress;
+                Handled::Consumed(self.with_drag(|this, drag| {
+                    if pressed && keycode.is_some_and(|keycode| drag.escape.contains(&keycode)) {
+                        return drag.machine.cancel();
+                    }
+
+                    this.pointer_update(drag, time)
+                }))
+            },
+            _ => Handled::No,
+        }
     }
 
-    fn drag_release(&self, event: &xlib::XButtonEvent) -> Handled {
-        if !self.is_drag_window(window_from(event.window)) {
-            return Handled::No;
-        }
+    /// Whether an XI2 crossing or focus event stems from the drag grab and is dropped.
+    pub(crate) fn drag_crossing_event(&self, event: &xinput2::XIEnterEvent) -> bool {
+        let Some(window) = window_from(event.event) else {
+            return false;
+        };
 
-        let time = time_from(event.time);
-        self.xconn.set_timestamp(time);
-        Handled::Consumed(self.with_drag(|_, drag| drag.machine.release(Instant::now(), time)))
+        let sources = self.drag_sources.borrow();
+        let active = sources.drag.as_ref().map(|drag| drag.window);
+        xdnd_source::from_drag_grab(event.mode, window, active, sources.ended_grab, Instant::now())
     }
 
-    fn drag_key(&self, event: &xlib::XKeyEvent) -> Handled {
-        if !self.is_drag_window(window_from(event.window)) {
-            return Handled::No;
+    /// Feeds the current pointer position and modifiers into the drag.
+    fn pointer_update(&self, drag: &mut OutgoingDrag, time: u32) -> Vec<Output> {
+        match self.query_pointer_state() {
+            Ok((x, y, mask)) => self.pointer_moved(drag, x, y, mask, time),
+            Err(err) => {
+                warn!("Failed to query the pointer during a drag: {err}");
+                Vec::new()
+            },
         }
-
-        let time = time_from(event.time);
-        self.xconn.set_timestamp(time);
-        let keycode = u8::try_from(event.keycode).ok();
-        let pressed = event.type_ == xlib::KeyPress;
-        Handled::Consumed(self.with_drag(|this, drag| {
-            if pressed && keycode.is_some_and(|keycode| drag.escape.contains(&keycode)) {
-                return drag.machine.cancel();
-            }
-
-            match this.query_pointer_state() {
-                Ok((x, y, mask)) => this.pointer_moved(drag, x, y, mask, time),
-                Err(err) => {
-                    warn!("Failed to query the modifiers during a drag: {err}");
-                    Vec::new()
-                },
-            }
-        }))
     }
 
     fn drag_client_message(&self, event: &xlib::XClientMessageEvent) -> Handled {
@@ -905,7 +962,7 @@ impl ActiveEventLoop {
         let property = if property == x11rb::NONE { target } else { property };
         let converted = {
             let mut sources = self.drag_sources.borrow_mut();
-            let DragSources { drag, incr } = &mut *sources;
+            let DragSources { drag, incr, .. } = &mut *sources;
             match drag.as_ref() {
                 Some(drag) if window_from(event.owner) == Some(drag.window) => {
                     xdnd_source::request_in_time(drag.owned_since, time)

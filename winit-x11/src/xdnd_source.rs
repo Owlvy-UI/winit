@@ -220,6 +220,36 @@ pub(crate) fn keycodes_for(
         .collect()
 }
 
+/// How long after a drag the crossing events of its ungrab are still expected.
+pub(crate) const UNGRAB_TIMEOUT: Duration = Duration::from_secs(1);
+
+const NOTIFY_GRAB: i32 = 1;
+const NOTIFY_UNGRAB: i32 = 2;
+
+/// The window of a drag grab that was released, and until when its ungrab events are expected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EndedGrab {
+    pub window: u32,
+    pub until: Instant,
+}
+
+/// Whether an XI2 crossing or focus event with `mode` on `window` stems from the drag grab.
+///
+/// `active` is the window of the running drag grab, `ended` the grab released last.
+pub(crate) fn from_drag_grab(
+    mode: i32,
+    window: u32,
+    active: Option<u32>,
+    ended: Option<EndedGrab>,
+    now: Instant,
+) -> bool {
+    match mode {
+        NOTIFY_GRAB | NOTIFY_UNGRAB if active == Some(window) => true,
+        NOTIFY_UNGRAB => ended.is_some_and(|ended| ended.window == window && now < ended.until),
+        _ => false,
+    }
+}
+
 /// A target that speaks XDND.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Target {
@@ -885,6 +915,22 @@ mod tests {
         assert!(keycodes_for(&keysyms, 0, 8, 0xff1b).is_empty());
         assert!(keycodes_for(&[], 2, 8, 0xff1b).is_empty());
         assert!(keycodes_for(&keysyms, 1, 254, 0xff1b).is_empty());
+    }
+
+    #[test]
+    fn grab_crossings_are_recognised() {
+        let now = Instant::now();
+        let ended = Some(EndedGrab { window: 7, until: now + UNGRAB_TIMEOUT });
+        assert!(from_drag_grab(NOTIFY_GRAB, 7, Some(7), None, now));
+        assert!(from_drag_grab(NOTIFY_UNGRAB, 7, Some(7), None, now));
+        assert!(!from_drag_grab(0, 7, Some(7), None, now));
+        assert!(!from_drag_grab(3, 7, Some(7), None, now));
+        assert!(!from_drag_grab(NOTIFY_GRAB, 8, Some(7), None, now));
+        assert!(from_drag_grab(NOTIFY_UNGRAB, 7, None, ended, now));
+        assert!(!from_drag_grab(NOTIFY_GRAB, 7, None, ended, now));
+        assert!(!from_drag_grab(NOTIFY_UNGRAB, 8, None, ended, now));
+        assert!(!from_drag_grab(NOTIFY_UNGRAB, 7, None, ended, now + UNGRAB_TIMEOUT));
+        assert!(!from_drag_grab(NOTIFY_UNGRAB, 7, None, None, now));
     }
 
     #[test]
