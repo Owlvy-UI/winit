@@ -12,6 +12,7 @@ use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::reexports::client::{Connection, Proxy, QueueHandle};
 
 use sctk::compositor::{CompositorHandler, CompositorState};
+use sctk::data_device_manager::DataDeviceManagerState;
 use sctk::output::{OutputHandler, OutputState};
 use sctk::registry::{ProvidesRegistryState, RegistryState};
 use sctk::seat::pointer::ThemedPointer;
@@ -23,6 +24,7 @@ use sctk::shm::slot::SlotPool;
 use sctk::shm::{Shm, ShmHandler};
 use sctk::subcompositor::SubcompositorState;
 
+use crate::platform_impl::wayland::dnd::DndState;
 use crate::platform_impl::wayland::event_loop::sink::EventSink;
 use crate::platform_impl::wayland::output::MonitorHandle;
 use crate::platform_impl::wayland::seat::{
@@ -109,6 +111,12 @@ pub struct WinitState {
     /// KWin blur manager.
     pub kwin_blur_manager: Option<KWinBlurManager>,
 
+    /// Data device manager, used for drag and drop.
+    pub data_device_manager_state: Option<DataDeviceManagerState>,
+
+    /// The state of the drag and drop operation.
+    pub dnd_state: DndState,
+
     /// Loop handle to re-register event sources, such as keyboard repeat.
     pub loop_handle: LoopHandle<'static, Self>,
 
@@ -177,6 +185,10 @@ impl WinitState {
             viewporter_state,
             fractional_scaling_manager,
             kwin_blur_manager: KWinBlurManager::new(globals, queue_handle).ok(),
+            data_device_manager_state: DataDeviceManagerState::bind(globals, queue_handle)
+                .map_err(|err| tracing::warn!("Data device manager not available: {err}"))
+                .ok(),
+            dnd_state: Default::default(),
 
             seats,
             text_input_state: TextInputState::new(globals, queue_handle).ok(),

@@ -12,6 +12,7 @@ use sctk::reexports::client::{Connection, Proxy, QueueHandle};
 use sctk::reexports::protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::ZwpRelativePointerV1;
 use sctk::reexports::protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
 
+use sctk::data_device_manager::data_device::DataDevice;
 use sctk::seat::pointer::{ThemeSpec, ThemedPointer};
 use sctk::seat::{Capability as SeatCapability, SeatHandler, SeatState};
 
@@ -57,6 +58,9 @@ pub struct WinitSeatState {
 
     /// Whether we have pending modifiers.
     modifiers_pending: bool,
+
+    /// The data device bound on the seat, used for drag and drop.
+    data_device: Option<DataDevice>,
 }
 
 impl WinitSeatState {
@@ -84,6 +88,13 @@ impl SeatHandler for WinitState {
                 return;
             },
         };
+
+        if seat_state.data_device.is_none() {
+            seat_state.data_device = self
+                .data_device_manager_state
+                .as_ref()
+                .map(|manager| manager.get_data_device(queue_handle, &seat));
+        }
 
         match capability {
             SeatCapability::Touch if seat_state.touch.is_none() => {
