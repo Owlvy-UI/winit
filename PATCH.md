@@ -92,7 +92,11 @@ Per backend:
   carries no position, so the last one is repeated before `DroppedFile`.
 - Windows, `src/platform_impl/windows/drop_handler.rs`: from the screen point
   of `DragEnter`, `DragOver` and `Drop`, through `ScreenToClient`. On enter and
-  drop it is sent before the first file event.
+  drop it is sent before the first file event. OLE calls `DragOver` repeatedly
+  while the pointer rests, so it is only sent when the point changed. The
+  `IDropTarget` vtable in `definitions.rs` takes `POINTL` by value, as COM
+  passes it; upstream declares it as `*const POINTL`, which only works there
+  because the value is never read.
 - macOS, `src/platform_impl/macos/window_delegate.rs`: from `draggingLocation`
   in `draggingEntered:`, the newly implemented `draggingUpdated:` and
   `performDragOperation:`, converted like regular mouse motion.

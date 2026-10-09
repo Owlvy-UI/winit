@@ -32,6 +32,8 @@ pub struct FileDropHandlerData {
     cursor_effect: u32,
     hovered_is_valid: bool, /* If the currently hovered item is not valid there must not be any
                              * `HoveredFileCancelled` emitted */
+    /// The screen point of the last reported drag position.
+    drag_point: Option<(i32, i32)>,
 }
 
 pub struct FileDropHandler {
@@ -48,6 +50,7 @@ impl FileDropHandler {
             send_event,
             cursor_effect: DROPEFFECT_NONE,
             hovered_is_valid: false,
+            drag_point: None,
         });
         FileDropHandler { data: Box::into_raw(data) }
     }
@@ -83,13 +86,11 @@ impl FileDropHandler {
         this: *mut IDropTarget,
         pDataObj: *const IDataObject,
         _grfKeyState: u32,
-        pt: *const POINTL,
+        pt: POINTL,
         pdwEffect: *mut u32,
     ) -> HRESULT {
         use crate::event::WindowEvent::HoveredFile;
         let drop_handler = unsafe { Self::from_interface(this) };
-        // SAFETY: OLE passes either null or a valid `POINTL` for the duration of the call.
-        let pt = unsafe { pt.as_ref() };
         let position_sent = Cell::new(false);
         let hdrop = unsafe {
             Self::iterate_filenames(pDataObj, |filename| {
@@ -103,6 +104,7 @@ impl FileDropHandler {
             })
         };
         drop_handler.hovered_is_valid = hdrop.is_some();
+        drop_handler.drag_point = Some((pt.x, pt.y));
         drop_handler.cursor_effect =
             if drop_handler.hovered_is_valid { DROPEFFECT_COPY } else { DROPEFFECT_NONE };
         unsafe {
@@ -115,13 +117,14 @@ impl FileDropHandler {
     pub unsafe extern "system" fn DragOver(
         this: *mut IDropTarget,
         _grfKeyState: u32,
-        pt: *const POINTL,
+        pt: POINTL,
         pdwEffect: *mut u32,
     ) -> HRESULT {
         let drop_handler = unsafe { Self::from_interface(this) };
-        if drop_handler.hovered_is_valid {
-            // SAFETY: OLE passes either null or a valid `POINTL` for the duration of the call.
-            drop_handler.send_position(unsafe { pt.as_ref() });
+        let point = (pt.x, pt.y);
+        if drop_handler.hovered_is_valid && drop_handler.drag_point != Some(point) {
+            drop_handler.drag_point = Some(point);
+            drop_handler.send_position(pt);
         }
 
         unsafe {
@@ -148,13 +151,11 @@ impl FileDropHandler {
         this: *mut IDropTarget,
         pDataObj: *const IDataObject,
         _grfKeyState: u32,
-        pt: *const POINTL,
+        pt: POINTL,
         _pdwEffect: *mut u32,
     ) -> HRESULT {
         use crate::event::WindowEvent::DroppedFile;
         let drop_handler = unsafe { Self::from_interface(this) };
-        // SAFETY: OLE passes either null or a valid `POINTL` for the duration of the call.
-        let pt = unsafe { pt.as_ref() };
         let position_sent = Cell::new(false);
         let hdrop = unsafe {
             Self::iterate_filenames(pDataObj, |filename| {
@@ -236,11 +237,7 @@ impl FileDropHandlerData {
     }
 
     /// Sends `CursorMoved` for a drag at the screen point `pt`.
-    fn send_position(&self, pt: Option<&POINTL>) {
-        let Some(pt) = pt else {
-            return;
-        };
-
+    fn send_position(&self, pt: POINTL) {
         let mut point = POINT { x: pt.x, y: pt.y };
         // SAFETY: `self.window` is the window this target is registered for and `point` is a
         // valid, writable `POINT`.
