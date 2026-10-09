@@ -35,6 +35,7 @@ use xkbcommon_dl::xkb_mod_mask_t;
 
 use crate::atoms::*;
 use crate::dnd::{ActionAtoms, SelectionType};
+use crate::drag_source::Handled;
 use crate::event_loop::{
     ALL_DEVICES, ActiveEventLoop, CookieResultExt, Device, DeviceInfo, DeviceType,
     ScrollOrientation, mkdid, mkwid,
@@ -145,6 +146,22 @@ impl EventProcessor {
     }
 
     fn process_xevent(&mut self, xev: &mut XEvent, app: &mut dyn ApplicationHandler) {
+        match self.target.drag_event(xev) {
+            Handled::No => {},
+            Handled::Observed(event) => {
+                if let Some((window_id, event)) = event {
+                    app.window_event(&self.target, window_id, event);
+                }
+            },
+            Handled::Consumed(event) => {
+                if let Some((window_id, event)) = event {
+                    app.window_event(&self.target, window_id, event);
+                }
+
+                return;
+            },
+        }
+
         let event_type = xev.get_type();
 
         // If we have IME disabled, don't try to `filter_event`, since only IME can consume them

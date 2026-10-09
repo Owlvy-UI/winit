@@ -18,6 +18,7 @@ macro_rules! os_error {
 mod activation;
 mod atoms;
 mod dnd;
+mod drag_source;
 mod event_loop;
 mod event_processor;
 pub mod ffi;
@@ -26,6 +27,7 @@ mod monitor;
 mod util;
 mod window;
 mod xdisplay;
+mod xdnd_source;
 mod xsettings;
 
 pub use dnd::{Selection, SelectionReader, SelectionType, UriListParseError};

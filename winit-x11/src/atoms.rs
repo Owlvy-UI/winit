@@ -93,6 +93,14 @@ atom_manager! {
     XdndSelection,
     XdndFinished,
     XdndTypeList,
+    XdndProxy,
+
+    // Selection conversion atoms
+    TARGETS,
+    TIMESTAMP,
+    MULTIPLE,
+    INCR,
+    ATOM_PAIR,
 
     // MIME types for reading selections
     TextUriList: b"text/uri-list",

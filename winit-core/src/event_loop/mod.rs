@@ -303,12 +303,23 @@ pub trait ActiveEventLoop: Any + fmt::Debug {
     /// - `send_data` - The data provided by this drag operation. See
     ///   [`DataTransferSendBuilder`](crate::data_transfer::DataTransferSendBuilder).
     /// - `actions` - The set of valid actions for this drag operation. See [`DndAction`]. On
-    ///   Wayland, this is expected to be ordered by preference.
+    ///   Wayland and X11, this is expected to be ordered by preference.
     /// - `icon` - The icon to show while dragging.
     ///
     /// Some platforms have a more-expressive way of setting the visual component of a drag
     /// operation. For those platforms, consider using the platform-specific implementation of
     /// [`DataTransferSend`] for `send_data` and set this field to `None`.
+    ///
+    /// ### Platform-specific
+    ///
+    /// - **X11:** The drag speaks XDND version 3 to 5. Only [`DndAction::Copy`] and
+    ///   [`DndAction::Move`] are offered; an error is returned when `actions` holds neither. The
+    ///   first of them is requested, Shift requests move and Control requests copy. The pointer
+    ///   and keyboard are grabbed until the drag ends, Escape cancels it. `icon` must be an
+    ///   [`RgbaIcon`](crate::icon::RgbaIcon) and needs the SHAPE extension, otherwise the drag runs
+    ///   without an icon. A target that does not answer a position within 2 seconds is left,
+    ///   and a drop that is not finished within 10 seconds ends in
+    ///   [`OutgoingDragCanceled`](crate::event::WindowEvent::OutgoingDragCanceled).
     ///
     /// ### Returns
     ///
@@ -378,7 +389,7 @@ pub enum DndAction {
     ///
     /// # Platforms
     ///
-    /// - X11 (receiving only)
+    /// - X11
     /// - Wayland
     /// - macOS
     /// - Windows

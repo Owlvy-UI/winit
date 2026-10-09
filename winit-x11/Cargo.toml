@@ -35,6 +35,7 @@ x11rb = { workspace = true, features = [
     "dl-libxcb",
     "randr",
     "resource_manager",
+    "shape",
     "sync",
     "xinput",
     "xkb",

@@ -19,14 +19,14 @@ use tracing::warn;
 use winit_common::xkb::Context;
 use winit_core::application::ApplicationHandler;
 use winit_core::cursor::{CustomCursor as CoreCustomCursor, CustomCursorSource};
-use winit_core::data_transfer::{DataTransfer, DataTransferId, TransferType};
+use winit_core::data_transfer::{DataTransfer, DataTransferId, DataTransferSend, TransferType};
 use winit_core::error::{EventLoopError, NotSupportedError, RequestError};
 use winit_core::event::{DeviceId, StartCause, WindowEvent};
 use winit_core::event_loop::pump_events::PumpStatus;
 use winit_core::event_loop::{
     ActiveEventLoop as RootActiveEventLoop, AsyncRequestSerial, ControlFlow, DeviceEvents,
-    DndAction, EventLoopProvider, EventLoopProxy as CoreEventLoopProxy, EventLoopProxyProvider,
-    OwnedDisplayHandle as CoreOwnedDisplayHandle,
+    DndAction, DragIcon, EventLoopProvider, EventLoopProxy as CoreEventLoopProxy,
+    EventLoopProxyProvider, OwnedDisplayHandle as CoreOwnedDisplayHandle,
 };
 use winit_core::monitor::MonitorHandle as CoreMonitorHandle;
 use winit_core::window::{Theme, Window as CoreWindow, WindowAttributes, WindowId};
@@ -42,6 +42,7 @@ use crate::atoms::{
     WM_DELETE_WINDOW,
 };
 use crate::dnd::Dnd;
+use crate::drag_source::DragSources;
 use crate::event_processor::{EventProcessor, MAX_MOD_REPLAY_LEN};
 use crate::ime::{self, Ime, ImeCreationError, ImeSender};
 use crate::util::{self, CustomCursor};
@@ -173,6 +174,7 @@ impl<T> PeekableReceiver<T> {
 pub struct ActiveEventLoop {
     pub(crate) xconn: Arc<XConnection>,
     pub(crate) dnd: RefCell<Dnd>,
+    pub(crate) drag_sources: RefCell<DragSources>,
     pub(crate) wm_delete_window: xproto::Atom,
     pub(crate) net_wm_ping: xproto::Atom,
     pub(crate) net_wm_sync_request: xproto::Atom,
@@ -363,6 +365,7 @@ impl EventLoop {
         let window_target = ActiveEventLoop {
             ime,
             dnd,
+            drag_sources: RefCell::default(),
             root,
             control_flow: Cell::new(ControlFlow::default()),
             exit: Cell::new(None),
@@ -534,6 +537,12 @@ impl EventLoop {
 
             min_timeout(control_flow_timeout, timeout)
         };
+        let drag_timeout = self
+            .event_processor
+            .target
+            .drag_deadline()
+            .map(|deadline| deadline.saturating_duration_since(start));
+        timeout = min_timeout(timeout, drag_timeout);
 
         self.state.x11_readiness = Readiness::EMPTY;
         if let Err(error) =
@@ -588,6 +597,11 @@ impl EventLoop {
 
         // Process all pending events
         self.drain_events(app);
+
+        let target = &self.event_processor.target;
+        if let Some((window_id, event)) = target.drag_tick(Instant::now()) {
+            app.window_event(target, window_id, event);
+        }
 
         // Empty activation tokens.
         while let Ok((window_id, serial)) = self.activation_receiver.try_recv() {
@@ -897,6 +911,16 @@ impl RootActiveEventLoop for ActiveEventLoop {
 
         Ok(())
     }
+
+    fn start_drag(
+        &self,
+        source: WindowId,
+        send_data: Box<dyn DataTransferSend>,
+        actions: &[DndAction],
+        icon: Option<DragIcon>,
+    ) -> Result<DataTransferId, RequestError> {
+        self.begin_drag(source, send_data, actions, icon)
+    }
 }
 
 impl rwh_06::HasDisplayHandle for ActiveEventLoop {
@@ -1016,6 +1040,9 @@ pub enum X11Error {
 
     /// Could not find an ARGB32 pict format.
     NoArgb32Format,
+
+    /// An outgoing drag could not be started.
+    DragStart(&'static str),
 }
 
 impl fmt::Display for X11Error {
@@ -1043,6 +1070,7 @@ impl fmt::Display for X11Error {
             X11Error::NoArgb32Format => {
                 f.write_str("winit only supports X11 displays with ARGB32 picture formats")
             },
+            X11Error::DragStart(s) => write!(f, "Failed to start the drag: {s}"),
         }
     }
 }

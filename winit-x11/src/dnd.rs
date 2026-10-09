@@ -172,13 +172,18 @@ impl DragState {
     }
 }
 
+/// A data transfer ID not handed out before, for incoming and outgoing drags alike.
+pub(crate) fn next_transfer_id() -> DataTransferId {
+    static DATA_TRANSFER_ID: AtomicI64 = AtomicI64::new(0);
+
+    DataTransferId::from_raw(DATA_TRANSFER_ID.fetch_add(1, Ordering::Relaxed))
+}
+
 impl Default for DragState {
     fn default() -> Self {
-        static DATA_TRANSFER_ID: AtomicI64 = AtomicI64::new(0);
-
         Self {
             version: Default::default(),
-            transfer_id: DataTransferId::from_raw(DATA_TRANSFER_ID.fetch_add(1, Ordering::Relaxed)),
+            transfer_id: next_transfer_id(),
             types: Default::default(),
             source_window: Default::default(),
             target_window: Default::default(),
@@ -216,44 +221,9 @@ pub struct SelectionType {
 
 impl SelectionType {
     pub(crate) fn new(atoms: &Atoms, atom: xproto::Atom) -> Self {
-        let atom_to_hint = [
-            // Files
-            (atoms[TextUriList], TypeHint::UriList),
-            // Plaintext
-            (atoms[STRING], TypeHint::Plaintext),
-            (atoms[UTF8_STRING], TypeHint::Plaintext),
-            (atoms[TextPlain], TypeHint::Plaintext),
-            (atoms[TextPlainCharsetUtf8], TypeHint::Plaintext),
-            // HTML
-            (atoms[TextHtml], TypeHint::Html),
-            (atoms[TextHtmlCharsetUtf8], TypeHint::Html),
-            // RTF
-            (atoms[ApplicationRtf], TypeHint::Rtf),
-            // Audio
-            (atoms[AudioAac], TypeHint::Audio { extension_hint: Some("aac") }),
-            (atoms[AudioAiff], TypeHint::Audio { extension_hint: Some("aif") }),
-            (atoms[AudioFlac], TypeHint::Audio { extension_hint: Some("flac") }),
-            (atoms[AudioVndWav], TypeHint::Audio { extension_hint: Some("wav") }),
-            (atoms[AudioVndWave], TypeHint::Audio { extension_hint: Some("wav") }),
-            (atoms[AudioWav], TypeHint::Audio { extension_hint: Some("wav") }),
-            (atoms[AudioWave], TypeHint::Audio { extension_hint: Some("wav") }),
-            (atoms[AudioXWav], TypeHint::Audio { extension_hint: Some("wav") }),
-            (atoms[AudioOgg], TypeHint::Audio { extension_hint: Some("ogg") }),
-            (atoms[AudioMpeg], TypeHint::Audio { extension_hint: Some("mp3") }),
-            // Image
-            (atoms[ImageBmp], TypeHint::Image { extension_hint: Some("bmp") }),
-            (atoms[ImageGif], TypeHint::Image { extension_hint: Some("gif") }),
-            (atoms[ImageJpeg], TypeHint::Image { extension_hint: Some("jpg") }),
-            (atoms[ImagePjpeg], TypeHint::Image { extension_hint: Some("jpg") }),
-            (atoms[ImagePng], TypeHint::Image { extension_hint: Some("png") }),
-            (atoms[ImageRaw], TypeHint::Image { extension_hint: Some("raw") }),
-            (atoms[ImageSvg], TypeHint::Image { extension_hint: Some("svg") }),
-            (atoms[ImageTiff], TypeHint::Image { extension_hint: Some("tiff") }),
-            (atoms[ImageWebp], TypeHint::Image { extension_hint: Some("webp") }),
-            (atoms[ImageXIcon], TypeHint::Image { extension_hint: Some("ico") }),
-        ];
-        let hint =
-            atom_to_hint.iter().find_map(|(haystack, hint)| (*haystack == atom).then_some(*hint));
+        let hint = hint_table(atoms)
+            .iter()
+            .find_map(|(haystack, hint)| (*haystack == atom).then_some(*hint));
 
         Self { hint, atom }
     }
@@ -261,6 +231,59 @@ impl SelectionType {
     pub fn atom(&self) -> xproto::Atom {
         self.atom
     }
+
+    /// The types offered for an outgoing type, in the order of the hint table.
+    pub(crate) fn offered_for(atoms: &Atoms, type_: &dyn TransferType) -> Vec<Self> {
+        if let Some(own) = type_.cast_ref::<Self>() {
+            return vec![own.clone()];
+        }
+
+        hint_table(atoms)
+            .into_iter()
+            .filter(|(_, hint)| TransferType::matches(hint, type_))
+            .map(|(atom, hint)| Self { hint: Some(hint), atom })
+            .collect()
+    }
+}
+
+/// The selection targets and the type hints they map to, preferred targets first.
+fn hint_table(atoms: &Atoms) -> [(xproto::Atom, TypeHint); 28] {
+    [
+        // Files
+        (atoms[TextUriList], TypeHint::UriList),
+        // Plaintext
+        (atoms[UTF8_STRING], TypeHint::Plaintext),
+        (atoms[TextPlainCharsetUtf8], TypeHint::Plaintext),
+        (atoms[TextPlain], TypeHint::Plaintext),
+        (atoms[STRING], TypeHint::Plaintext),
+        // HTML
+        (atoms[TextHtmlCharsetUtf8], TypeHint::Html),
+        (atoms[TextHtml], TypeHint::Html),
+        // RTF
+        (atoms[ApplicationRtf], TypeHint::Rtf),
+        // Audio
+        (atoms[AudioAac], TypeHint::Audio { extension_hint: Some("aac") }),
+        (atoms[AudioAiff], TypeHint::Audio { extension_hint: Some("aif") }),
+        (atoms[AudioFlac], TypeHint::Audio { extension_hint: Some("flac") }),
+        (atoms[AudioVndWav], TypeHint::Audio { extension_hint: Some("wav") }),
+        (atoms[AudioVndWave], TypeHint::Audio { extension_hint: Some("wav") }),
+        (atoms[AudioWav], TypeHint::Audio { extension_hint: Some("wav") }),
+        (atoms[AudioWave], TypeHint::Audio { extension_hint: Some("wav") }),
+        (atoms[AudioXWav], TypeHint::Audio { extension_hint: Some("wav") }),
+        (atoms[AudioOgg], TypeHint::Audio { extension_hint: Some("ogg") }),
+        (atoms[AudioMpeg], TypeHint::Audio { extension_hint: Some("mp3") }),
+        // Image
+        (atoms[ImageBmp], TypeHint::Image { extension_hint: Some("bmp") }),
+        (atoms[ImageGif], TypeHint::Image { extension_hint: Some("gif") }),
+        (atoms[ImageJpeg], TypeHint::Image { extension_hint: Some("jpg") }),
+        (atoms[ImagePjpeg], TypeHint::Image { extension_hint: Some("jpg") }),
+        (atoms[ImagePng], TypeHint::Image { extension_hint: Some("png") }),
+        (atoms[ImageRaw], TypeHint::Image { extension_hint: Some("raw") }),
+        (atoms[ImageSvg], TypeHint::Image { extension_hint: Some("svg") }),
+        (atoms[ImageTiff], TypeHint::Image { extension_hint: Some("tiff") }),
+        (atoms[ImageWebp], TypeHint::Image { extension_hint: Some("webp") }),
+        (atoms[ImageXIcon], TypeHint::Image { extension_hint: Some("ico") }),
+    ]
 }
 
 impl TransferType for SelectionType {

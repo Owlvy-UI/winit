@@ -18,16 +18,22 @@ impl XConnection {
         window: xproto::Window,
         cursor: Option<CursorIcon>,
     ) -> Result<(), X11Error> {
-        let cursor = {
-            let mut cache = self.cursor_cache.lock().unwrap_or_else(|e| e.into_inner());
-
-            match cache.entry(cursor) {
-                Entry::Occupied(o) => *o.get(),
-                Entry::Vacant(v) => *v.insert(self.get_cursor(cursor)?),
-            }
-        };
+        let cursor = self.cached_cursor(cursor)?;
 
         self.update_cursor(window, cursor)
+    }
+
+    /// The cursor for `cursor`, loaded once and kept in the cache.
+    pub(crate) fn cached_cursor(
+        &self,
+        cursor: Option<CursorIcon>,
+    ) -> Result<xproto::Cursor, X11Error> {
+        let mut cache = self.cursor_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        match cache.entry(cursor) {
+            Entry::Occupied(o) => Ok(*o.get()),
+            Entry::Vacant(v) => Ok(*v.insert(self.get_cursor(cursor)?)),
+        }
     }
 
     pub(crate) fn set_custom_cursor(

@@ -116,9 +116,9 @@ pub enum WindowEvent {
         /// [`crate::event_loop::ActiveEventLoop::set_valid_dnd_actions`], the actions available on
         /// the source, and the held modifier keys.
         ///
-        /// This may be `None` if the backend has not supplied a valid action. On some platforms
-        /// (in particular, X11), the application is only informed of the proposed action once
-        /// the operation completes.
+        /// This may be `None` if the backend has not supplied a valid action. On X11 it is the
+        /// action answered to the source for this position, and `None` while the drag is
+        /// rejected.
         proposed_action: Option<DndAction>,
     },
     /// A drag operation has dropped file(s) on the window.
