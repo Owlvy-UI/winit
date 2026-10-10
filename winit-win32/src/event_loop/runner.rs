@@ -186,7 +186,7 @@ impl EventLoopRunner {
         };
 
         if hr == DRAGDROP_S_DROP {
-            let action = drop_effect_to_dnd_action(effect_out);
+            let action = drop_effect_to_dnd_action(data_object.performed_effect(effect_out));
 
             self.send_event(Event::Window {
                 window_id,

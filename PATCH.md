@@ -93,14 +93,15 @@ feature of `x11rb`):
   allowed actions, Shift for move, Control for copy. A status naming an action
   outside the allowed list counts as a rejection.
 - `XdndFinished` emits `OutgoingDragDropped` with its action (version 5) or the
-  last accepted action (older targets). A failed finish, a release over no
+  last accepted action (older targets), a move turned into copy as section 6
+  describes. A failed finish, a release over no
   accepting target, Escape, loss of the selection and unmapping or destroying
   the source window emit `OutgoingDragCanceled`.
 - A target that does not answer `XdndPosition` within 2 seconds is left and not
   entered again until the pointer leaves it. A drop without `XdndFinished`
   within 10 seconds is canceled. The event loop wakes up for these deadlines.
-- `SelectionRequest` is answered for `TARGETS`, `TIMESTAMP`, `MULTIPLE` and
-  every offered type. URIs are sent as `text/uri-list` with CRLF, `STRING` as
+- `SelectionRequest` is answered for `TARGETS`, `TIMESTAMP`, `MULTIPLE`,
+  `DELETE` (section 6) and every offered type. URIs are sent as `text/uri-list` with CRLF, `STRING` as
   ISO-8859-1 (refused when the text does not fit), other text as UTF-8. Data
   larger than one request goes by `INCR` to foreign windows, at most 16
   transfers at once with a 10 second stall timeout.
@@ -113,3 +114,77 @@ feature of `x11rb`):
 
 `winit-core`: the `start_drag` docs describe X11, and the `DragPosition` docs no
 longer claim that X11 reports the action only at the end.
+
+## 5. Performed action of an outgoing drag on Windows
+
+`winit-win32/src/dnd.rs`, `event_loop/runner.rs`: the shell moves files with an
+optimized move and returns `DROPEFFECT_NONE` from `DoDragDrop`. The source data
+object keeps what the target stores with `SetData`, and `OutgoingDragDropped`
+reports, in this order, the nonzero `Logical Performed DropEffect`, the effect
+returned by `DoDragDrop` when it is not `DROPEFFECT_NONE`, else the stored
+`Performed DropEffect`.
+
+## 6. Move on X11 follows `DELETE`
+
+XDND implements `XdndActionMove` by converting the data and then the target
+`DELETE` before `XdndFinished` (`atoms.rs`: `DELETE`, `NULL`).
+
+Source (`xdnd_source.rs`, `drag_source.rs`):
+
+- `DELETE` is answered between `XdndDrop` and `XdndFinished` with an empty
+  property of type `NULL`, and refused before the drop and after the finish.
+- `OutgoingDragDropped` reports `Move` only when the target converted `DELETE`
+  before `XdndFinished` and the finish names move (version 5) or move was the
+  last accepted action (version 4). A finished move without `DELETE` is
+  reported as `Copy`, since the data was not deleted at the target's request.
+
+Target (`dnd.rs`, `event_processor.rs`, `drag_source.rs`):
+
+- After a drop with the accepted action move and at least one completed data
+  transfer, the target converts `DELETE` and sends `XdndFinished` when the
+  answer arrives, or after 2 seconds without one (`drag_deadline` and
+  `drag_tick`). A drop without received data finishes at once.
+- A `SelectionNotify` with property `None` is handled before the property
+  check: it pops the refused fetch, or answers `DELETE`, also when the target
+  field is `None`. A refused or unreadable fetch moves on to the next fetch or
+  to the end of the drop instead of leaving the drop unfinished.
+- `XdndStatus` and `XdndFinished` without an accepted action carry 0 in the
+  action field, not the atom named `None`.
+
+Observed peers (Xvfb, `xtrace`):
+
+- GTK 3 as target converts `DELETE` after a move (`gtk_drag_finish` with
+  `del`), so a drag to GTK reports `Move`; with Control it reports `Copy`.
+  Mousepad finishes a dropped file with move but never converts `DELETE`, so
+  that drop reports `Copy`.
+- Qt 5 as target finishes with move and never converts `DELETE`, so a drag to
+  Qt reports `Copy`.
+- GTK 3 as source answers the `DELETE` of a winit target and emits
+  `drag-data-delete`. Qt 5 as source refuses `DELETE` with target `None` and
+  deletes on the finished move by itself.
+
+## 7. Dropped offers on Wayland
+
+`winit-wayland/src/dnd.rs`, `event_loop/mod.rs`: a dropped offer is kept until
+it is finished or destroyed, so the application can fetch data and answer
+`ask` after `DragDropped`. Upstream finished or destroyed it during the drop.
+
+- The `leave` that follows a drop neither emits `DragLeft` nor destroys the
+  offer. `accept` is not sent for fetches after the drop.
+- Transfers started on the offer are counted until their pipe is read to the
+  end.
+- After the event loop delivered `DragDropped` and the application handled the
+  events of that iteration, the offer is finished and destroyed when its action
+  is copy or move, version 3 or newer and no transfer is open. Without a final
+  action (or before version 3) it is only destroyed, which cancels the source.
+- For a drop with the action `ask`, `set_valid_dnd_actions` after the drop sends
+  `set_actions` with the first copy or move of the list that the source offers,
+  as both the accepted and the preferred action, and the offer finishes as
+  above. A list without such an action destroys the offer.
+- A dropped offer that has not ended 10 seconds after the drop is destroyed.
+
+## 8. Trash on macOS
+
+`winit-appkit/src/dnd.rs`: the source mask of an outgoing drag that allows move
+also allows `NSDragOperationDelete`, and an ended drag with the operation
+`Delete` (a drop on the Trash) reports `Move`.

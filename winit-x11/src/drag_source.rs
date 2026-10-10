@@ -19,7 +19,8 @@ use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
 
 use crate::atoms::{
-    _NET_WM_WINDOW_TYPE, _NET_WM_WINDOW_TYPE_DND, ATOM_PAIR, AtomName, INCR, MULTIPLE, STRING,
+    _NET_WM_WINDOW_TYPE, _NET_WM_WINDOW_TYPE_DND, ATOM_PAIR, AtomName, DELETE, INCR, MULTIPLE, NULL,
+    STRING,
     TARGETS, TIMESTAMP, XdndAware, XdndDrop, XdndEnter, XdndFinished, XdndLeave, XdndPosition,
     XdndProxy, XdndSelection, XdndStatus, XdndTypeList,
 };
@@ -769,10 +770,8 @@ impl ActiveEventLoop {
         let sources = self.drag_sources.borrow();
         let drag = sources.drag.as_ref().and_then(|drag| drag.machine.deadline());
         let incr = sources.incr.iter().map(|incr| incr.deadline).min();
-        match (drag, incr) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        let delete = self.dnd.borrow().deadline();
+        [drag, incr, delete].into_iter().flatten().min()
     }
 
     /// Handles the drag timeouts that expired at `now`.
@@ -789,6 +788,7 @@ impl ActiveEventLoop {
             self.stop_property_events(incr.requestor);
         }
 
+        self.dnd.borrow_mut().tick(now);
         self.with_drag(|_, drag| drag.machine.tick(now))
     }
 
@@ -963,10 +963,15 @@ impl ActiveEventLoop {
         let converted = {
             let mut sources = self.drag_sources.borrow_mut();
             let DragSources { drag, incr, .. } = &mut *sources;
-            match drag.as_ref() {
+            match drag.as_mut() {
                 Some(drag) if window_from(event.owner) == Some(drag.window) => {
                     xdnd_source::request_in_time(drag.owned_since, time)
-                        && self.convert(drag, incr, requestor, target, property)
+                        && if target == atoms[DELETE] {
+                            drag.machine.delete()
+                                && self.write_property(requestor, property, atoms[NULL], &[])
+                        } else {
+                            self.convert(drag, incr, requestor, target, property)
+                        }
                 },
                 _ => false,
             }

@@ -101,6 +101,8 @@ atom_manager! {
     MULTIPLE,
     INCR,
     ATOM_PAIR,
+    DELETE,
+    NULL,
 
     // MIME types for reading selections
     TextUriList: b"text/uri-list",
@@ -130,8 +132,6 @@ atom_manager! {
     ImageXIcon: b"image/x-icon",
     ImageRaw: b"image/x-panasonic-raw",
 
-    None: b"None",
-
     // Miscellaneous Atoms
     _GTK_THEME_VARIANT,
     _MOTIF_WM_HINTS,
@@ -156,8 +156,5 @@ impl Index<AtomName> for Atoms {
         index.atom_from(self)
     }
 }
-
-// Make sure `None` is still defined.
-pub(crate) use core::option::Option::None;
 
 pub(crate) use AtomName::*;

@@ -367,6 +367,7 @@ pub(crate) struct Machine {
     blocked: Option<u32>,
     pointer: Option<Pointer>,
     feedback: Feedback,
+    deleted: bool,
 }
 
 impl Machine {
@@ -379,7 +380,18 @@ impl Machine {
             blocked: None,
             pointer: None,
             feedback: Feedback::NoDrop,
+            deleted: false,
         }
+    }
+
+    /// The target converted `DELETE`. Returns whether the request is answered, which it is
+    /// only between `XdndDrop` and `XdndFinished`.
+    pub(crate) fn delete(&mut self) -> bool {
+        let dropped = matches!(self.phase, Phase::Dropped { .. });
+        if dropped {
+            self.deleted = true;
+        }
+        dropped
     }
 
     /// The actions the drag allows.
@@ -570,6 +582,12 @@ impl Machine {
             if finished.success { Outcome::Dropped(finished.action) } else { Outcome::Canceled }
         } else {
             Outcome::Dropped(self.accepted_action())
+        };
+        let outcome = match outcome {
+            Outcome::Dropped(Some(DndAction::Move)) if !self.deleted => {
+                Outcome::Dropped(Some(DndAction::Copy))
+            },
+            other => other,
         };
         self.finish(outcome, &mut out);
         out
@@ -988,9 +1006,67 @@ mod tests {
         let now = Instant::now();
         let mut machine = copy_move();
         dropped(&mut machine, OTHER, DndAction::Move, now);
+        assert!(machine.delete());
         let finished = Finished { window: OTHER.window, success: false, action: None };
         assert_eq!(machine.finished(finished), vec![Output::Finish(Outcome::Dropped(Some(
             DndAction::Move
+        )))]);
+    }
+
+    #[test]
+    fn a_move_without_delete_is_a_copy() {
+        let now = Instant::now();
+        let mut machine = copy_move();
+        dropped(&mut machine, TARGET, DndAction::Move, now);
+        let finished =
+            Finished { window: TARGET.window, success: true, action: Some(DndAction::Move) };
+        assert_eq!(machine.finished(finished), vec![Output::Finish(Outcome::Dropped(Some(
+            DndAction::Copy
+        )))]);
+
+        let mut machine = copy_move();
+        dropped(&mut machine, OTHER, DndAction::Move, now);
+        let finished = Finished { window: OTHER.window, success: true, action: None };
+        assert_eq!(machine.finished(finished), vec![Output::Finish(Outcome::Dropped(Some(
+            DndAction::Copy
+        )))]);
+    }
+
+    #[test]
+    fn a_move_with_delete_is_a_move() {
+        let now = Instant::now();
+        let mut machine = copy_move();
+        dropped(&mut machine, TARGET, DndAction::Move, now);
+        assert!(machine.delete());
+        let finished =
+            Finished { window: TARGET.window, success: true, action: Some(DndAction::Move) };
+        assert_eq!(machine.finished(finished), vec![Output::Finish(Outcome::Dropped(Some(
+            DndAction::Move
+        )))]);
+    }
+
+    #[test]
+    fn delete_is_refused_outside_the_drop() {
+        let now = Instant::now();
+        let mut machine = copy_move();
+        assert!(!machine.delete());
+        machine.motion(now, Some(TARGET), pointer(1, 1, DndAction::Move));
+        assert!(!machine.delete());
+        dropped(&mut machine, TARGET, DndAction::Move, now);
+        machine.finished(Finished { window: TARGET.window, success: true, action: None });
+        assert!(!machine.delete());
+    }
+
+    #[test]
+    fn delete_does_not_turn_a_copy_into_a_move() {
+        let now = Instant::now();
+        let mut machine = copy_move();
+        dropped(&mut machine, TARGET, DndAction::Copy, now);
+        assert!(machine.delete());
+        let finished =
+            Finished { window: TARGET.window, success: true, action: Some(DndAction::Copy) };
+        assert_eq!(machine.finished(finished), vec![Output::Finish(Outcome::Dropped(Some(
+            DndAction::Copy
         )))]);
     }
 

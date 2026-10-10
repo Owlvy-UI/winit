@@ -4,12 +4,13 @@ use std::os::raw::*;
 use std::str::Utf8Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, Instant};
 
+use tracing::warn;
 use winit_core::data_transfer::{DataTransfer, DataTransferId, TransferType, TypeHint, TypedData};
 use winit_core::event_loop::{AsyncRequestSerial, DndAction};
 use x11rb::protocol::xproto::{self, ConnectionExt};
 
-use crate::atoms::AtomName::None as DndNone;
 use crate::atoms::*;
 use crate::event_loop::{CookieResultExt, X11Error};
 use crate::xdisplay::XConnection;
@@ -61,6 +62,41 @@ pub(crate) fn choose_action(
     match requested {
         Some(action) if supported(action) && valid.contains(&action) => Some(action),
         _ => valid.contains(&DndAction::Copy).then_some(DndAction::Copy),
+    }
+}
+
+/// How long the target waits for the answer to its `DELETE` request.
+const DELETE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The accept flag and action atom of `XdndStatus` and `XdndFinished`, both 0 for a rejection.
+fn accept_fields(action: Option<xproto::Atom>) -> (u32, xproto::Atom) {
+    match action {
+        Some(action) => (1, action),
+        None => (0, x11rb::NONE),
+    }
+}
+
+/// Whether a finished drop asks the source for `DELETE` before `XdndFinished`.
+fn needs_delete(action: Option<DndAction>, received: bool) -> bool {
+    action == Some(DndAction::Move) && received
+}
+
+/// A `DELETE` request awaiting its `SelectionNotify`, after which `XdndFinished` is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingDelete {
+    this_window: xproto::Window,
+    source_window: xproto::Window,
+    deadline: Instant,
+}
+
+impl PendingDelete {
+    fn new(this_window: xproto::Window, source_window: xproto::Window, now: Instant) -> Self {
+        let deadline = now.checked_add(DELETE_TIMEOUT).unwrap_or(now);
+        Self { this_window, source_window, deadline }
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        now >= self.deadline
     }
 }
 
@@ -163,6 +199,10 @@ pub struct DragState {
     pub valid_actions: Vec<DndAction>,
     /// The action the source requested in the last `XdndPosition`.
     pub requested_action: Option<DndAction>,
+    /// Whether a data transfer of this drag completed.
+    pub received: bool,
+    /// The `DELETE` request sent after a move, if one is outstanding.
+    pub delete: Option<PendingDelete>,
 }
 
 impl DragState {
@@ -191,6 +231,8 @@ impl Default for DragState {
             finished: None,
             valid_actions: Vec::new(),
             requested_action: None,
+            received: false,
+            delete: None,
         }
     }
 }
@@ -354,11 +396,9 @@ impl Dnd {
                 "Drag-and-drop state was not initialized (called `send_finished` before XdndEnter",
             ));
         };
-        let (accepted, action) =
-            match state.chosen_action().and_then(|action| ActionAtoms::new(atoms).atom(action)) {
-                Some(action) => (1, action),
-                None => (0, atoms[DndNone]),
-            };
+        let (accepted, action) = accept_fields(
+            state.chosen_action().and_then(|action| ActionAtoms::new(atoms).atom(action)),
+        );
         self.xconn
             .send_client_msg(target_window, target_window, atoms[XdndFinished] as _, None, [
                 this_window,
@@ -370,6 +410,61 @@ impl Dnd {
             .ignore_error();
 
         Ok(())
+    }
+
+    /// Ends a drop: requests `DELETE` after a move with received data, else sends `XdndFinished`.
+    pub fn finish_drop(
+        &mut self,
+        this_window: xproto::Window,
+        source_window: xproto::Window,
+        now: Instant,
+    ) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        if !needs_delete(state.chosen_action(), state.received) {
+            self.finish_now(this_window, source_window);
+            return;
+        }
+
+        state.delete = Some(PendingDelete::new(this_window, source_window, now));
+        let delete = self.xconn.atoms()[DELETE];
+        self.convert_selection(this_window, self.xconn.timestamp(), delete);
+    }
+
+    /// Sends the `XdndFinished` an answered `DELETE` request waited for.
+    ///
+    /// Returns `false` when no `DELETE` request is outstanding.
+    pub fn delete_answered(&mut self) -> bool {
+        let Some(pending) = self.state.as_mut().and_then(|state| state.delete.take()) else {
+            return false;
+        };
+        self.finish_now(pending.this_window, pending.source_window);
+        true
+    }
+
+    /// The instant at which an outstanding `DELETE` request is given up.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.state.as_ref()?.delete.map(|pending| pending.deadline)
+    }
+
+    /// Sends `XdndFinished` when the `DELETE` request is unanswered at `now`.
+    pub fn tick(&mut self, now: Instant) {
+        let expired = self
+            .state
+            .as_mut()
+            .and_then(|state| state.delete.take_if(|pending| pending.expired(now)));
+        if let Some(pending) = expired {
+            warn!("The drag source did not answer DELETE; finishing the drop");
+            self.finish_now(pending.this_window, pending.source_window);
+        }
+    }
+
+    fn finish_now(&self, this_window: xproto::Window, source_window: xproto::Window) {
+        // SAFETY: `send_finished` only sends a client message over the connection.
+        if let Err(err) = unsafe { self.send_finished(this_window, source_window) } {
+            warn!("Failed to send `XdndFinished`: {err}");
+        }
     }
 
     pub unsafe fn get_type_list(
@@ -407,10 +502,7 @@ impl Dnd {
     ) -> Result<(), X11Error> {
         let atoms = self.xconn.atoms();
         let (accepted, action) =
-            match action.and_then(|action| ActionAtoms::new(atoms).atom(action)) {
-                Some(action) => (1, action),
-                None => (0, atoms[DndNone]),
-            };
+            accept_fields(action.and_then(|action| ActionAtoms::new(atoms).atom(action)));
         self.xconn
             .send_client_msg(target_window, target_window, atoms[XdndStatus] as _, None, [
                 this_window,
@@ -441,9 +533,35 @@ impl Dnd {
 mod tests {
     use winit_core::event_loop::DndAction;
 
-    use super::{ActionAtoms, choose_action};
+    use std::time::Instant;
+
+    use super::{
+        ActionAtoms, DELETE_TIMEOUT, PendingDelete, accept_fields, choose_action, needs_delete,
+    };
 
     const ATOMS: ActionAtoms = ActionAtoms { copy: 10, move_: 11 };
+
+    #[test]
+    fn a_rejection_sends_zero_not_the_none_atom() {
+        assert_eq!(accept_fields(None), (0, 0));
+        assert_eq!(accept_fields(Some(11)), (1, 11));
+    }
+
+    #[test]
+    fn only_a_move_with_received_data_deletes() {
+        assert!(needs_delete(Some(DndAction::Move), true));
+        assert!(!needs_delete(Some(DndAction::Move), false));
+        assert!(!needs_delete(Some(DndAction::Copy), true));
+        assert!(!needs_delete(None, true));
+    }
+
+    #[test]
+    fn a_delete_request_expires() {
+        let now = Instant::now();
+        let pending = PendingDelete::new(1, 2, now);
+        assert!(!pending.expired(now));
+        assert!(pending.expired(now + DELETE_TIMEOUT));
+    }
 
     #[test]
     fn atoms_map_to_actions() {

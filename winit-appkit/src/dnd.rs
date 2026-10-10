@@ -199,17 +199,22 @@ pub fn ns_drag_operation_to_dnd_action(value: NSDragOperation) -> Option<DndActi
         (NSDragOperation::Private, DndAction::Private),
         // Sometimes the OS returns `Generic`, in which case we just fall back to `Copy`.
         (NSDragOperation::Generic, DndAction::Copy),
+        // A drop on the Trash asks the source to delete the data.
+        (NSDragOperation::Delete, DndAction::Move),
     ]
     .into_iter()
     .find_map(|(appkit, winit)| value.contains(appkit).then_some(winit))
 }
 
+/// The source operation mask for the actions of an outgoing drag. A move also allows `Delete`,
+/// the operation of the Trash.
 pub fn dnd_actions_to_ns_drag_operation(value: &[DndAction]) -> NSDragOperation {
-    value
+    let mask = value
         .iter()
         .copied()
         .map(dnd_action_to_ns_drag_operation)
-        .fold(NSDragOperation::empty(), BitOr::bitor)
+        .fold(NSDragOperation::empty(), BitOr::bitor);
+    if mask.contains(NSDragOperation::Move) { mask | NSDragOperation::Delete } else { mask }
 }
 
 pub fn preferred_drag_operation(
@@ -524,9 +529,29 @@ mod tests {
     use objc2_app_kit::NSDragOperation;
     use winit_core::event_loop::DndAction;
 
-    use super::{accepted_drag_operation, preferred_drag_operation};
+    use super::{
+        accepted_drag_operation, dnd_actions_to_ns_drag_operation, ns_drag_operation_to_dnd_action,
+        preferred_drag_operation,
+    };
 
     const MOVE_COPY: [DndAction; 2] = [DndAction::Move, DndAction::Copy];
+
+    #[test]
+    fn a_move_allows_the_trash() {
+        assert_eq!(
+            dnd_actions_to_ns_drag_operation(&MOVE_COPY),
+            NSDragOperation::Move | NSDragOperation::Copy | NSDragOperation::Delete
+        );
+        assert_eq!(dnd_actions_to_ns_drag_operation(&[DndAction::Copy]), NSDragOperation::Copy);
+        assert_eq!(dnd_actions_to_ns_drag_operation(&[]), NSDragOperation::empty());
+    }
+
+    #[test]
+    fn delete_is_reported_as_move() {
+        assert_eq!(ns_drag_operation_to_dnd_action(NSDragOperation::Delete), Some(DndAction::Move));
+        assert_eq!(ns_drag_operation_to_dnd_action(NSDragOperation::Copy), Some(DndAction::Copy));
+        assert_eq!(ns_drag_operation_to_dnd_action(NSDragOperation::empty()), None);
+    }
 
     #[test]
     fn preference_order_is_kept() {

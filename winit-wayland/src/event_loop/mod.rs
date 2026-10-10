@@ -468,6 +468,7 @@ impl EventLoop {
         // Handle non-synthetic events.
         self.with_state(|state| {
             buffer_sink.append(&mut state.events_sink);
+            state.dnd_state.mark_drop_dispatched();
         });
         for event in buffer_sink.drain() {
             match event {
@@ -479,6 +480,7 @@ impl EventLoop {
                 },
             }
         }
+        self.with_state(|state| state.dnd_state.settle_drop());
 
         // Collect the window ids
         self.with_state(|state| {
@@ -788,7 +790,7 @@ impl RootActiveEventLoop for ActiveEventLoop {
         id: DataTransferId,
         type_: &dyn TransferType,
     ) -> Result<AsyncRequestSerial, RequestError> {
-        let state = self.state.borrow_mut();
+        let mut state = self.state.borrow_mut();
         let Some(current_drag) = state.dnd_state.receive_drag() else {
             return Err(RequestError::Ignored);
         };
@@ -813,7 +815,9 @@ impl RootActiveEventLoop for ActiveEventLoop {
         let window_id = current_drag.window_id();
         let mut mime_type = Some(mime_type.clone());
 
-        let _ = state.loop_handle.insert_source(ReadPipe::from(readfd), move |_, file, state| {
+        let dropped = current_drag.is_dropped();
+        let offer = current_drag.clone();
+        let inserted = state.loop_handle.insert_source(ReadPipe::from(readfd), move |_, file, state| {
             // SAFETY: We do not overwrite the referent of `file`
             let file = unsafe { file.get_mut() };
 
@@ -838,12 +842,19 @@ impl RootActiveEventLoop for ActiveEventLoop {
                 },
                 window_id,
             );
+            state.dnd_state.transfer_done(id);
 
             PostAction::Remove
         });
+        if let Err(err) = inserted {
+            return Err(os_error!(err.error).into());
+        }
 
-        current_drag.accept(current_drag.serial(), Some(mime_type_str.clone()));
-        data_offer::receive_to_fd(current_drag, mime_type_str, writefd);
+        if !dropped {
+            offer.accept(offer.serial(), Some(mime_type_str.clone()));
+        }
+        data_offer::receive_to_fd(&offer, mime_type_str, writefd);
+        state.dnd_state.transfer_started(id);
 
         Ok(async_request_serial)
     }
@@ -866,13 +877,18 @@ impl RootActiveEventLoop for ActiveEventLoop {
         id: DataTransferId,
         actions: &[DndAction],
     ) -> Result<(), RequestError> {
-        let state = self.state.borrow();
-        let Some(state) = state.dnd_state.receive_drag() else {
+        let mut state = self.state.borrow_mut();
+        let Some(state) = state.dnd_state.receive_drag_mut() else {
             return Err(os_error!(UnknownDataTransfer(id)).into());
         };
 
         if state.transfer_id() != id {
             return Err(os_error!(UnknownDataTransfer(id)).into());
+        }
+
+        if state.is_dropped() {
+            state.answer_ask(actions);
+            return Ok(());
         }
 
         let any_actions = state.set_actions(actions);

@@ -1400,6 +1400,64 @@ impl SourceDataObject {
     pub(crate) fn interface_ptr(&self) -> *mut c_void {
         self.data as *mut c_void
     }
+
+    /// The `DROPEFFECT` a target stored with `SetData` under the clipboard format `name`.
+    fn stored_effect(&self, name: &str) -> Option<DropEffect> {
+        let cf = register_clipboard_format(name)?;
+        // SAFETY: `self.data` stays valid while `self` holds its reference.
+        let me = unsafe { &*self.data };
+        let extras = me.extras.try_borrow().ok()?;
+        let (_, medium) = extras.iter().find(|(f, _)| f.cfFormat == cf)?;
+        if medium.0.tymed != TYMED_HGLOBAL as u32 {
+            return None;
+        }
+        // SAFETY: the tymed says the union holds an HGLOBAL owned by `medium`.
+        let hglobal = unsafe { medium.0.u.hGlobal };
+        // SAFETY: `hglobal` is a live global memory handle.
+        if unsafe { GlobalSize(hglobal) } < std::mem::size_of::<DropEffect>() {
+            return None;
+        }
+        // SAFETY: as above; the lock is released below.
+        let ptr = unsafe { GlobalLock(hglobal) }.cast::<DropEffect>();
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: the block holds at least one `DropEffect`.
+        let effect = unsafe { ptr.read_unaligned() };
+        // SAFETY: matches the `GlobalLock` above.
+        unsafe { GlobalUnlock(hglobal) };
+        Some(effect)
+    }
+
+    /// The effect a finished drop performed, from the `DoDragDrop` result and the shell formats.
+    pub(crate) fn performed_effect(&self, returned: DropEffect) -> DropEffect {
+        resolve_performed_effect(
+            returned,
+            self.stored_effect("Performed DropEffect"),
+            self.stored_effect("Logical Performed DropEffect"),
+        )
+    }
+}
+
+/// Picks the action of a drop: the logical effect, else the returned one, else the performed one.
+fn resolve_performed_effect(
+    returned: DropEffect,
+    performed: Option<DropEffect>,
+    logical: Option<DropEffect>,
+) -> DropEffect {
+    if let Some(logical) = logical.filter(|&e| e != DROPEFFECT_NONE) {
+        return logical;
+    }
+    if returned != DROPEFFECT_NONE {
+        return returned;
+    }
+    match performed {
+        Some(effect) => effect,
+        None => {
+            tracing::debug!("drop target stored no performed drop effect");
+            DROPEFFECT_NONE
+        },
+    }
 }
 
 impl Drop for SourceDataObject {
@@ -1704,5 +1762,33 @@ mod tests {
         assert!(is_new_report(Some(report), DragReport { y: -4, ..report }));
         assert!(is_new_report(Some(report), DragReport { action: Some(DndAction::Move), ..report }));
         assert!(is_new_report(Some(report), DragReport { action: None, ..report }));
+    }
+
+    #[test]
+    fn optimized_move_reports_the_logical_effect() {
+        let effect = resolve_performed_effect(
+            DROPEFFECT_NONE,
+            Some(DROPEFFECT_NONE),
+            Some(DROPEFFECT_MOVE),
+        );
+        assert_eq!(effect, DROPEFFECT_MOVE);
+    }
+
+    #[test]
+    fn returned_effect_wins_without_a_logical_effect() {
+        assert_eq!(resolve_performed_effect(DROPEFFECT_COPY, None, None), DROPEFFECT_COPY);
+        assert_eq!(
+            resolve_performed_effect(DROPEFFECT_COPY, Some(DROPEFFECT_MOVE), Some(DROPEFFECT_NONE)),
+            DROPEFFECT_COPY
+        );
+    }
+
+    #[test]
+    fn performed_effect_fills_in_for_an_empty_result() {
+        assert_eq!(
+            resolve_performed_effect(DROPEFFECT_NONE, Some(DROPEFFECT_MOVE), None),
+            DROPEFFECT_MOVE
+        );
+        assert_eq!(resolve_performed_effect(DROPEFFECT_NONE, None, None), DROPEFFECT_NONE);
     }
 }

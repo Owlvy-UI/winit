@@ -4,6 +4,7 @@ use std::mem::MaybeUninit;
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
 use std::slice;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use dpi::{PhysicalPosition, PhysicalSize};
 use tracing::warn;
@@ -626,10 +627,7 @@ impl EventProcessor {
             {
                 state.finished = Some((window, source_window));
             } else {
-                unsafe {
-                    dnd.send_finished(window, source_window)
-                        .expect("Failed to send `XdndFinished` message.");
-                }
+                dnd.finish_drop(window, source_window, Instant::now());
             }
 
             return;
@@ -656,7 +654,33 @@ impl EventProcessor {
 
         // For now, winit only supports selections for drag-and-drop. This should be changed
         // when clipboard support is implemented.
-        if xev.property != atoms[XdndSelection] as c_ulong {
+        if xev.selection != c_ulong::from(atoms[XdndSelection]) {
+            return;
+        }
+
+        // A refused `DELETE` may come back with `None` as its target.
+        let delete_answer = xev.target == c_ulong::from(atoms[DELETE])
+            || xev.target == c_ulong::from(x11rb::NONE);
+        if delete_answer && self.target.dnd.get_mut().delete_answered()
+        {
+            return;
+        }
+
+        if xev.property == c_ulong::from(x11rb::NONE) {
+            let refused = self
+                .target
+                .dnd
+                .get_mut()
+                .state_mut()
+                .and_then(|state| state.pending_fetch_types.pop_front());
+            if refused.is_some() {
+                warn!("The drag source refused a selection conversion");
+                self.next_fetch_or_finish();
+            }
+            return;
+        }
+
+        if xev.property != c_ulong::from(atoms[XdndSelection]) {
             return;
         }
 
@@ -708,13 +732,19 @@ impl EventProcessor {
             (state.transfer_id, serial, type_)
         };
 
-        let value = match self.target.dnd.borrow().read_data(xwindow, type_) {
+        let read = self.target.dnd.borrow().read_data(xwindow, type_);
+        let value = match read {
             Ok(value) => Arc::new(value),
             Err(err) => {
                 warn!("Failed to read selection: {err}");
+                self.next_fetch_or_finish();
                 return;
             },
         };
+
+        if let Some(state) = self.target.dnd.get_mut().state_mut() {
+            state.received = true;
+        }
 
         let window_id = mkwid(xwindow);
 
@@ -724,9 +754,14 @@ impl EventProcessor {
             value,
         });
 
-        let dnd = self.target.dnd.borrow();
+        self.next_fetch_or_finish();
+    }
 
-        // If we have another fetch pending, request it from the drag source window
+    /// Requests the next pending fetch from the drag source, or ends a drop that waited for
+    /// its fetches.
+    fn next_fetch_or_finish(&mut self) {
+        let dnd = self.target.dnd.get_mut();
+
         if let Some((window, type_)) = dnd.state().and_then(|state| {
             state
                 .pending_fetch_types
@@ -735,13 +770,10 @@ impl EventProcessor {
                 .map(|(_, type_)| (state.target_window, type_))
         }) {
             dnd.convert_selection(window, self.target.xconn.timestamp(), type_.atom());
-        } else if let Some((this_window, target_window)) =
-            dnd.state().and_then(|state| state.finished)
+        } else if let Some((this_window, source_window)) =
+            dnd.state_mut().and_then(|state| state.finished.take())
         {
-            unsafe {
-                dnd.send_finished(this_window, target_window)
-                    .expect("Failed to send `XdndFinished` message.");
-            }
+            dnd.finish_drop(this_window, source_window, Instant::now());
         }
     }
 

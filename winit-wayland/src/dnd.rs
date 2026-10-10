@@ -5,8 +5,10 @@ use std::fmt;
 use std::io::{self, BufRead, Cursor, ErrorKind, Write};
 use std::ops::{BitOr, Deref};
 use std::sync::Arc;
+use std::time::Duration;
 
 use calloop::PostAction;
+use calloop::timer::{TimeoutAction, Timer};
 use dpi::{LogicalPosition, PhysicalPosition};
 use sctk::data_device_manager::WritePipe;
 use sctk::data_device_manager::data_device::{DataDeviceData, DataDeviceHandler};
@@ -426,6 +428,54 @@ pub struct DataOffer {
     data_device_id: ObjectId,
     serial: u32,
     window_id: WindowId,
+    /// Whether the offer was dropped.
+    dropped: bool,
+    /// The action of the dropped offer, final once it is not `ask`.
+    dropped_action: WlDndAction,
+    /// Transfers started and not yet read to the end.
+    pending_transfers: usize,
+    /// Whether `DragDropped` reached the application.
+    drop_dispatched: bool,
+}
+
+/// How long a dropped offer may wait for its final action and transfers.
+const DROP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a dropped offer does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropEnd {
+    Wait,
+    Finish,
+    Destroy,
+}
+
+/// Decides the end of a dropped offer from its action, open transfers and offer version.
+pub(crate) fn drop_end(
+    action: WlDndAction,
+    pending_transfers: usize,
+    drop_dispatched: bool,
+    version: u32,
+) -> DropEnd {
+    if !drop_dispatched || pending_transfers > 0 || action == WlDndAction::Ask {
+        DropEnd::Wait
+    } else if version >= 3 && finishes_drop(action) {
+        DropEnd::Finish
+    } else {
+        DropEnd::Destroy
+    }
+}
+
+/// The final action for a drop that selected `ask`: the first copy or move in `actions` the
+/// source offers.
+pub(crate) fn ask_answer(actions: &[DndAction], source_actions: WlDndAction) -> Option<WlDndAction> {
+    actions.iter().find_map(|action| {
+        let wl = match action {
+            DndAction::Copy => WlDndAction::Copy,
+            DndAction::Move => WlDndAction::Move,
+            _ => return None,
+        };
+        source_actions.contains(wl).then_some(wl)
+    })
 }
 
 pub(crate) fn dnd_action_winit_to_wl(winit: DndAction) -> WlDndAction {
@@ -469,6 +519,25 @@ impl DataOffer {
 
     pub(crate) fn window_id(&self) -> WindowId {
         self.window_id
+    }
+
+    pub(crate) fn is_dropped(&self) -> bool {
+        self.dropped
+    }
+
+    /// Sends the final action of a drop that selected `ask`. Other drops are left alone.
+    pub(crate) fn answer_ask(&mut self, action_set: &[DndAction]) {
+        if !self.dropped || self.dropped_action != WlDndAction::Ask {
+            return;
+        }
+
+        match ask_answer(action_set, self.available_actions) {
+            Some(action) => {
+                self.data.set_actions(action, action);
+                self.dropped_action = action;
+            },
+            None => self.dropped_action = WlDndAction::empty(),
+        }
     }
 
     pub(crate) fn set_actions(&self, action_set: &[DndAction]) -> bool {
@@ -574,6 +643,66 @@ impl DndState {
         self.receive_drag.as_ref()
     }
 
+    pub(crate) fn receive_drag_mut(&mut self) -> Option<&mut DataOffer> {
+        self.receive_drag.as_mut()
+    }
+
+    /// Counts a transfer started on the offer `id`.
+    pub(crate) fn transfer_started(&mut self, id: DataTransferId) {
+        if let Some(offer) = self.receive_drag.as_mut().filter(|offer| offer.transfer_id() == id) {
+            offer.pending_transfers = offer.pending_transfers.saturating_add(1);
+        }
+    }
+
+    /// Counts a transfer on the offer `id` that was read to the end.
+    pub(crate) fn transfer_done(&mut self, id: DataTransferId) {
+        if let Some(offer) = self.receive_drag.as_mut().filter(|offer| offer.transfer_id() == id) {
+            offer.pending_transfers = offer.pending_transfers.saturating_sub(1);
+        }
+    }
+
+    /// Marks that the `DragDropped` of a dropped offer is being delivered.
+    pub(crate) fn mark_drop_dispatched(&mut self) {
+        if let Some(offer) = self.receive_drag.as_mut().filter(|offer| offer.dropped) {
+            offer.drop_dispatched = true;
+        }
+    }
+
+    /// Finishes or destroys a dropped offer once its action is final and its transfers ended.
+    pub(crate) fn settle_drop(&mut self) {
+        let Some(offer) = self.receive_drag.as_ref().filter(|offer| offer.dropped) else {
+            return;
+        };
+        match drop_end(
+            offer.dropped_action,
+            offer.pending_transfers,
+            offer.drop_dispatched,
+            offer.version(),
+        ) {
+            DropEnd::Wait => {},
+            DropEnd::Finish => {
+                offer.finish();
+                offer.destroy();
+                self.receive_drag = None;
+            },
+            DropEnd::Destroy => {
+                offer.destroy();
+                self.receive_drag = None;
+            },
+        }
+    }
+
+    /// Destroys the dropped offer `id` that did not settle in time.
+    pub(crate) fn expire_drop(&mut self, id: DataTransferId) {
+        let expired = self
+            .receive_drag
+            .take_if(|offer| offer.dropped && offer.transfer_id() == id);
+        if let Some(offer) = expired {
+            tracing::warn!("A dropped offer did not get a final action in time; destroying it");
+            offer.destroy();
+        }
+    }
+
     pub(crate) fn set_send_drag(&mut self, source: DragSource) {
         self.send_drag = Some(source);
     }
@@ -660,6 +789,10 @@ impl DataDeviceHandler for WinitState {
             data_device_id: data_device.id(),
             data: drag.inner().clone(),
             window_id,
+            dropped: false,
+            dropped_action: WlDndAction::empty(),
+            pending_transfers: 0,
+            drop_dispatched: false,
         });
 
         current_drag.set_actions(&[]);
@@ -687,6 +820,11 @@ impl DataDeviceHandler for WinitState {
             return;
         };
 
+        // A dropped offer stays until it is finished or destroyed in `settle_drop`.
+        if self.dnd_state.receive_drag().is_some_and(DataOffer::is_dropped) {
+            return;
+        }
+
         if let Some(current_drag) = self.dnd_state.receive_drag() {
             self.events_sink.push_window_event(
                 WindowEvent::DragLeft { id: current_drag.transfer_id() },
@@ -697,7 +835,7 @@ impl DataDeviceHandler for WinitState {
             self.dnd_state.receive_drag = None;
         }
 
-        if let Some(drag) = data.drag_offer() {
+        if let Some(drag) = data.drag_offer().filter(|drag| !drag.dropped) {
             drag.destroy();
         }
         if let Some(selection) = data.selection_offer() {
@@ -789,22 +927,25 @@ impl DataDeviceHandler for WinitState {
             None
         };
 
+        let id = current_drag.transfer_id();
         self.events_sink.push_window_event(
-            WindowEvent::DragDropped { id: current_drag.transfer_id(), proposed_action },
+            WindowEvent::DragDropped { id, proposed_action },
             window_id,
         );
 
-        if let Some(receive_drag) = self.dnd_state.receive_drag.take() {
-            if receive_drag.version() >= 3 && finishes_drop(drag.selected_action) {
-                receive_drag.finish();
-            }
+        if let Some(offer) = self.dnd_state.receive_drag_mut() {
+            offer.dropped = true;
+            offer.dropped_action = drag.selected_action;
         }
 
-        if let Some(drag) = data.drag_offer() {
-            drag.destroy();
-        }
-        if let Some(selection) = data.selection_offer() {
-            selection.destroy();
+        let timer = Timer::from_duration(DROP_TIMEOUT);
+        let inserted = self.loop_handle.insert_source(timer, move |_, _, state| {
+            state.dispatched_events = true;
+            state.dnd_state.expire_drop(id);
+            TimeoutAction::Drop
+        });
+        if let Err(err) = inserted {
+            tracing::warn!("Failed to arm the drop timeout: {err}");
         }
     }
 }
@@ -813,7 +954,37 @@ impl DataDeviceHandler for WinitState {
 mod tests {
     use wayland_client::protocol::wl_data_device_manager::DndAction as WlDndAction;
 
-    use super::finishes_drop;
+    use winit_core::event_loop::DndAction;
+
+    use super::{DropEnd, ask_answer, drop_end, finishes_drop};
+
+    #[test]
+    fn a_drop_waits_for_the_application_and_its_transfers() {
+        assert_eq!(drop_end(WlDndAction::Copy, 0, false, 3), DropEnd::Wait);
+        assert_eq!(drop_end(WlDndAction::Copy, 1, true, 3), DropEnd::Wait);
+        assert_eq!(drop_end(WlDndAction::Move, 0, true, 3), DropEnd::Finish);
+    }
+
+    #[test]
+    fn an_ask_drop_waits_for_the_answer() {
+        assert_eq!(drop_end(WlDndAction::Ask, 0, true, 3), DropEnd::Wait);
+    }
+
+    #[test]
+    fn a_drop_without_a_final_action_is_destroyed() {
+        assert_eq!(drop_end(WlDndAction::empty(), 0, true, 3), DropEnd::Destroy);
+        assert_eq!(drop_end(WlDndAction::Copy, 0, true, 2), DropEnd::Destroy);
+    }
+
+    #[test]
+    fn ask_is_answered_with_an_offered_copy_or_move() {
+        let both = WlDndAction::Copy | WlDndAction::Move | WlDndAction::Ask;
+        assert_eq!(ask_answer(&[DndAction::Move], both), Some(WlDndAction::Move));
+        assert_eq!(ask_answer(&[DndAction::Ask, DndAction::Copy], both), Some(WlDndAction::Copy));
+        assert_eq!(ask_answer(&[DndAction::Move], WlDndAction::Copy | WlDndAction::Ask), None);
+        assert_eq!(ask_answer(&[DndAction::Ask], both), None);
+        assert_eq!(ask_answer(&[], both), None);
+    }
 
     #[test]
     fn copy_and_move_finish() {
