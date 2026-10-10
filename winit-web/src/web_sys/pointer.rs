@@ -117,9 +117,7 @@ impl PointerHandler {
         self.on_pointer_press =
             Some(canvas_common.add_event("pointerdown", move |event: PointerEvent| {
                 if prevent_default.get() {
-                    // prevent text selection
-                    event.prevent_default();
-                    // but still focus element
+                    // focus the element
                     let _ = canvas.focus();
                 }
 
@@ -161,7 +159,12 @@ impl PointerHandler {
                     event.is_primary(),
                     event::pointer_position(&event).to_physical(super::scale_factor(&window)),
                     source,
-                )
+                );
+
+                // Prevents text selection, except when the handler prepared a drag.
+                if prevent_default.get() && !canvas.draggable() {
+                    event.prevent_default();
+                }
             }));
     }
 

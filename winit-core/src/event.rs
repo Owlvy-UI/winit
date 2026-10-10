@@ -116,9 +116,10 @@ pub enum WindowEvent {
         /// [`crate::event_loop::ActiveEventLoop::set_valid_dnd_actions`], the actions available on
         /// the source, and the held modifier keys.
         ///
-        /// This may be `None` if the backend has not supplied a valid action. On X11 it is the
-        /// action answered to the source for this position, and `None` while the drag is
-        /// rejected.
+        /// This may be `None` if the backend has not supplied a valid action. On X11, Android and
+        /// the web it is the action answered to the source for this position, and `None` while
+        /// the drag is rejected. On iOS it is the first valid action the session allows, where
+        /// move is allowed only for drags from the same application.
         proposed_action: Option<DndAction>,
     },
     /// A drag operation has dropped file(s) on the window.

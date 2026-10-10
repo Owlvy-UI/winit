@@ -68,6 +68,7 @@ macro_rules! os_error {
 
 mod r#async;
 mod cursor;
+mod dnd;
 mod event;
 pub(crate) mod event_loop;
 mod lock;
@@ -93,6 +94,7 @@ use winit_core::event_loop::ActiveEventLoop;
 use winit_core::monitor::MonitorHandleProvider;
 use winit_core::window::{PlatformWindowAttributes, Window};
 
+pub use self::dnd::WebTransferType;
 pub use self::event_loop::{EventLoop, PlatformSpecificEventLoopAttributes};
 use self::web_sys as backend;
 use self::window::Window as WebWindow;

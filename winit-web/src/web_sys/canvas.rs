@@ -57,6 +57,7 @@ struct Handlers {
     on_intersect: Option<IntersectionObserverHandle>,
     on_touch_end: Option<EventListenerHandle<dyn FnMut(Event)>>,
     on_context_menu: Option<EventListenerHandle<dyn FnMut(PointerEvent)>>,
+    drag_and_drop: Option<super::dnd::DragHandler>,
 }
 
 pub struct Common {
@@ -185,6 +186,7 @@ impl Canvas {
                 on_intersect: None,
                 on_touch_end: None,
                 on_context_menu: None,
+                drag_and_drop: None,
             }),
         })
     }
@@ -464,6 +466,17 @@ impl Canvas {
             }));
     }
 
+    pub(crate) fn on_drag_and_drop(&self, dnd: &super::dnd::DragAndDrop, runner: runner::Shared) {
+        self.handlers.borrow_mut().drag_and_drop = Some(super::dnd::DragHandler::new(
+            dnd,
+            runner,
+            self.id,
+            self.raw(),
+            self.window(),
+            self.document(),
+        ));
+    }
+
     pub(crate) fn request_fullscreen(&self, fullscreen: Fullscreen) {
         fullscreen::request_fullscreen(
             self.main_thread,
@@ -543,6 +556,7 @@ impl Canvas {
         handlers.animation_frame_handler.cancel();
         handlers.on_touch_end = None;
         handlers.on_context_menu = None;
+        handlers.drag_and_drop = None;
     }
 }
 

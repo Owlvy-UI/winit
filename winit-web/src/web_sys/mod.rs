@@ -1,5 +1,6 @@
 mod animation_frame;
 mod canvas;
+pub(crate) mod dnd;
 pub mod event;
 mod event_handle;
 mod fullscreen;

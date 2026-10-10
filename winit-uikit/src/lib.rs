@@ -102,6 +102,7 @@
 #![warn(clippy::exhaustive_enums)]
 
 mod app_state;
+mod dnd;
 mod event_loop;
 mod monitor;
 mod view;

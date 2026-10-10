@@ -7,11 +7,13 @@ use std::sync::Arc;
 use web_sys::Element;
 use winit_core::application::ApplicationHandler;
 use winit_core::cursor::{CustomCursor as CoreCustomCursor, CustomCursorSource};
+use winit_core::data_transfer::{DataTransfer, DataTransferId, DataTransferSend, TransferType};
 use winit_core::error::{NotSupportedError, RequestError};
 use winit_core::event::{ElementState, KeyEvent, TouchPhase, WindowEvent};
 use winit_core::event_loop::{
-    ActiveEventLoop as RootActiveEventLoop, ControlFlow, DeviceEvents,
-    EventLoopProxy as RootEventLoopProxy, OwnedDisplayHandle as CoreOwnedDisplayHandle,
+    ActiveEventLoop as RootActiveEventLoop, AsyncRequestSerial, ControlFlow, DeviceEvents,
+    DndAction, DragIcon, EventLoopProxy as RootEventLoopProxy,
+    OwnedDisplayHandle as CoreOwnedDisplayHandle,
 };
 use winit_core::keyboard::ModifiersState;
 use winit_core::monitor::MonitorHandle as CoremMonitorHandle;
@@ -49,11 +51,16 @@ impl Clone for ModifiersShared {
 pub struct ActiveEventLoop {
     pub(crate) runner: runner::Shared,
     modifiers: ModifiersShared,
+    dnd: backend::dnd::DragAndDrop,
 }
 
 impl ActiveEventLoop {
     pub fn new() -> Self {
-        Self { runner: runner::Shared::new(), modifiers: ModifiersShared::default() }
+        Self {
+            runner: runner::Shared::new(),
+            modifiers: ModifiersShared::default(),
+            dnd: backend::dnd::DragAndDrop::default(),
+        }
     }
 
     pub(crate) fn run(&self, app: Box<dyn ApplicationHandler>) {
@@ -70,6 +77,8 @@ impl ActiveEventLoop {
 
     pub fn register(&self, canvas: &Rc<backend::Canvas>, window_id: WindowId) {
         let canvas_clone = canvas.clone();
+
+        canvas.on_drag_and_drop(&self.dnd, self.runner.clone());
 
         canvas.on_touch_start();
 
@@ -550,6 +559,36 @@ impl RootActiveEventLoop for ActiveEventLoop {
 
     fn rwh_06_handle(&self) -> &dyn rwh_06::HasDisplayHandle {
         self
+    }
+
+    fn fetch_data_transfer(
+        &self,
+        id: DataTransferId,
+        type_: &dyn TransferType,
+    ) -> Result<AsyncRequestSerial, RequestError> {
+        self.dnd.fetch(&self.runner, id, type_)
+    }
+
+    fn data_transfer(&self, id: DataTransferId) -> Result<Box<dyn DataTransfer>, RequestError> {
+        self.dnd.data_transfer(id)
+    }
+
+    fn set_valid_dnd_actions(
+        &self,
+        id: DataTransferId,
+        actions: &[DndAction],
+    ) -> Result<(), RequestError> {
+        self.dnd.set_valid_actions(id, actions)
+    }
+
+    fn start_drag(
+        &self,
+        source: WindowId,
+        send_data: Box<dyn DataTransferSend>,
+        actions: &[DndAction],
+        icon: Option<DragIcon>,
+    ) -> Result<DataTransferId, RequestError> {
+        self.dnd.start(&self.runner, source, send_data, actions, icon)
     }
 }
 

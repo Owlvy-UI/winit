@@ -188,3 +188,170 @@ it is finished or destroyed, so the application can fetch data and answer
 `winit-appkit/src/dnd.rs`: the source mask of an outgoing drag that allows move
 also allows `NSDragOperationDelete`, and an ended drag with the operation
 `Delete` (a drop on the Trash) reports `Move`.
+
+## 9. Drag and drop on Android
+
+Upstream returns `NotSupported` from every data transfer method on Android. The
+fork adds `winit-android/src/dnd.rs` (state without a virtual machine, unit
+tested), `drag_and_drop.rs` (JNI), the Java listener
+`java/org/rustwindowing/winit/DragAndDrop.java` compiled by `build-dex.sh` into
+`dnd.dex`, hooks in `event_loop.rs`, and `jni` as a direct dependency (the
+version `android-activity` already uses).
+
+- `dnd.dex` is embedded and loaded with `InMemoryDexClassLoader` without a
+  parent. Its native methods are registered on load. On every
+  `MainEvent::Start` the listener is set as `View.OnDragListener` of the decor
+  view, on the UI thread. Its callbacks fill a queue and wake the event loop,
+  which delivers the events to the window after the input events.
+- `ACTION_DRAG_ENTERED` emits `DragEntered` without a position (Android gives
+  none), `ACTION_DRAG_LOCATION` emits `DragPosition`, `ACTION_DRAG_EXITED` and
+  an `ACTION_DRAG_ENDED` without a drop emit `DragLeft`. Positions waiting in
+  the queue are coalesced.
+- Android knows no drag actions. A winit source writes its copy and move codes
+  into the extras of the `ClipDescription`; a foreign source offers copy. The
+  proposed action is the first of `set_valid_dnd_actions` that the source
+  offers. `ACTION_DROP` without one returns false and emits `DragLeft`.
+  Otherwise it emits a last `DragPosition` and `DragDropped` with the action.
+- Types are the MIME types of the description (at most 64). `text/plain` and
+  `text/html` carry their hints; every other type stands for items with a URI
+  and adds `text/uri-list`. At the drop the text, HTML and URI of every item are
+  read (at most 256 items and 32 MiB). Fetches made before the drop are answered
+  after it, and later fetches are answered at once until the next drag enters.
+- A drop with `content:` URIs from another application calls
+  `requestDragAndDropPermissions`. The permissions are kept until the next such
+  drop.
+- `start_drag` hands text, HTML and the URI list to `startDragAndDrop` with
+  `DRAG_FLAG_GLOBAL | DRAG_FLAG_GLOBAL_URI_READ` on the UI thread. Bytes, image
+  and audio types are not sent, and `file:` URIs are refused, since Android
+  throws `FileUriExposedException` for them. Only copy and move are offered. An
+  `RgbaIcon` of at most 1024 by 1024 pixels is the drag shadow, touched at the
+  negated offset.
+- A winit target answers its action through a `Binder` that travels in the
+  intent of the first item. `ACTION_DRAG_ENDED` with a result emits
+  `OutgoingDragDropped`: `Move` only when a winit target answered move, else
+  `Copy`. Without a result, or when the drag could not be started, it emits
+  `OutgoingDragCanceled`. Nothing is deleted on move; the action is a report.
+
+Observed in Waydroid (Android 13, two test applications with different package
+names in freeform windows, `input draganddrop`): a move inside one application,
+copy and move from one application into the other with the data received, and a
+drop on the launcher reported as `OutgoingDragCanceled`.
+
+## 10. Drag and drop on iOS
+
+Upstream returns `NotSupported` from every data transfer method on iOS. The fork
+adds `winit-uikit/src/dnd.rs`, delegates on `WinitView` in `view.rs`, the
+methods in `event_loop.rs` and the drag state in `app_state.rs`.
+
+Receiving (`UIDropInteraction` on the view of each window):
+
+- `sessionDidEnter` emits `DragEntered` with the position, `sessionDidUpdate`
+  emits `DragPosition`, `sessionDidExit` emits `DragLeft`, `performDrop` emits a
+  last `DragPosition` and `DragDropped`. A session that ends without either
+  emits `DragLeft`. Positions are `locationInView` times `contentScaleFactor`.
+- The proposal is the first action passed to `set_valid_dnd_actions` that the
+  session allows: copy always, move only for a drag of the same application
+  whose session allows move. It is answered as `UIDropOperation` copy or move,
+  an empty list cancels and a list without an allowed action forbids. The same
+  action is reported as `proposed_action`.
+- `data_transfer` lists the registered type identifiers of all items (at most
+  1024 items and 256 types). Plain text, HTML, RTF, URL and file URL, PNG,
+  JPEG, TIFF, GIF, HEIC, MP3, WAV, AIFF and M4A carry a `TypeHint`;
+  `public.image` and `public.audio` map to image and audio without extension.
+- `fetch_data_transfer` loads a data representation of at most 64 MiB and
+  delivers `DataTransferReceived` on the main queue. Data of another
+  application is released only by the drop, so a fetch before the drop starts
+  when the drop happens. `UriList` collects one URI per item from `public.url`
+  or `public.file-url`, or copies the file representation of an item without
+  one (at most 1 GiB) into `winit-dnd` in the temporary directory and reports
+  its file URI.
+
+Sending (`UIDragInteraction` on the same view):
+
+- UIKit starts a drag only with its own lift gesture. `start_drag` arms the
+  data while a touch of the source window is down and returns its ID; the next
+  lift in that window takes it. The last touch ending without a lift, or a new
+  `start_drag`, emits `OutgoingDragCanceled` for the armed drag. Without armed
+  data the lift yields no items and no drag begins.
+- The first item registers every offered type, loaded from the
+  `DataTransferSend` on request, and the first URI; every further URI is an
+  item of its own (`public.url`, and `public.file-url` for `file:` URIs). Move
+  is allowed when the actions contain it; the session is not restricted to the
+  application.
+- An `RgbaIcon` is the lift preview, placed at the icon offset; without one the
+  preview is a 1 point view.
+- `didEndWithOperation` copy or move emits `OutgoingDragDropped` with that
+  action, cancel and forbidden emit `OutgoingDragCanceled`. Nothing is deleted
+  at the target's request; a move is a report only.
+
+Checked with clippy for `aarch64-apple-ios` only; never run.
+
+## 11. Drag and drop on the web
+
+`winit-web/src/dnd.rs`, `web_sys/dnd.rs`, `web_sys/canvas.rs`,
+`web_sys/pointer.rs`, `event_loop/window_target.rs`, web-sys features for drag
+events and files. Upstream returns `NotSupported` from all four data transfer
+methods on the web.
+
+- The canvas listens to `dragenter`, `dragover`, `dragleave` and `drop`.
+  `DragEntered` carries the position, `DragPosition` is sent only when the
+  position or the action changed. A `dragleave` whose related target lies
+  inside the canvas is ignored.
+- The action is the requested one (Shift for move, Control for copy, both for
+  link) when the application and `effectAllowed` of the source allow it, else
+  the first action passed to `set_valid_dnd_actions` that the source allows. It
+  is answered as `dropEffect`. Every `dragover` is canceled. A rejected drag
+  answers `none`, so the browser fires no `drop`, does not open a dropped file,
+  and the window receives `DragLeft`.
+- Types come from `DataTransfer.types` and the file items: `text/plain`,
+  `text/html`, `text/uri-list` and `text/rtf` map to their hints, files of type
+  `image/*` and `audio/*` to `Image` and `Audio`, everything else has no hint.
+  `WebTransferType` exposes the MIME type and, after the drop, the file name.
+- Strings are readable only during `drop`, so every string type is read then
+  (at most 16 MiB each) and every file is read with `arrayBuffer()` (at most
+  256 MiB). Fetches made before the drop are answered after it. At most 64
+  types and 256 waiting fetches are kept. The data stays available until the
+  next drag enters.
+- `start_drag` works only while a button is held on the source canvas, since
+  browsers start a drag only from a gesture. It makes the canvas `draggable`.
+  `dragstart` fills the text types (`setData`), `effectAllowed` from `actions`
+  and the drag image from an `RgbaIcon`. `dragend` emits `OutgoingDragDropped`
+  with the `dropEffect`, or `OutgoingDragCanceled` for `none`. A release
+  without `dragstart` cancels the drag.
+- `pointerdown` calls `preventDefault` only after the handler ran and only when
+  the handler did not prepare a drag, since a canceled `pointerdown` suppresses
+  the drag.
+- Image and audio data are not sent: Chrome drops files added in `dragstart`
+  and then reports the file name as `text/plain`.
+- Move deletes nothing. `OutgoingDragDropped` with `Move` means the target
+  answered `dropEffect` move. During a drag the browser sends no pointer
+  events, and the release of the button does not reach the application.
+
+## 12. Mouse and stylus on Android
+
+`winit-android/src/pointer.rs` (unit tested), `event_loop.rs`. Upstream skips
+every pointer whose tool is `ToolType::Mouse` and reports styluses as
+`Unknown`.
+
+- Fingers report `Touch` as before. Unknown tools report `Unknown`.
+- A mouse reports `PointerKind::Mouse`, a stylus `TabletTool(Pen)` and an
+  eraser `TabletTool(Eraser)`, with `primary` set. Hover enter and move emit
+  `PointerEntered` and `PointerMoved`. Android ends the hover right before a
+  press and starts it again after the release, so a hover exit becomes
+  `PointerLeft` only when the input batch ends without a further event of the
+  same device. A change of the tool on one device leaves with the old kind and
+  enters with the new one. Hover events stay `Unhandled` (section 1).
+- Mouse buttons follow the button state: primary, secondary, tertiary, back and
+  forward become `Left`, `Right`, `Middle`, `Back` and `Forward`. A press
+  without a button state, as injected input sends it, is `Left`.
+- A stylus contact is `TabletToolButton::Contact`, the stylus buttons are
+  `Barrel` and `Other(1)`. Tool data carries the pressure as force and the angle
+  from `AXIS_TILT` and `AXIS_ORIENTATION` (altitude π/2 minus the tilt,
+  azimuth the orientation turned to 3 o'clock).
+- `ACTION_SCROLL` emits `MouseWheel` with `LineDelta(-AXIS_HSCROLL,
+  AXIS_VSCROLL)`. A cancel releases held buttons and leaves.
+
+Observed in Waydroid: `input mouse tap` and `input mouse swipe` report a mouse
+with `Left`, `input stylus swipe` a pen with its contact. Hover and scroll could
+not be injected there: the shell `input` of Android 13 has no hover action or
+scroll command, and the shell user cannot open `/dev/uhid`.

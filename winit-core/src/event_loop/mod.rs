@@ -218,6 +218,11 @@ pub trait ActiveEventLoop: Any + fmt::Debug {
     ///
     /// Once available, the data will be supplied to the application with the
     /// [`DataTransferReceived`](crate::event::WindowEvent::DataTransferReceived) event.
+    ///
+    /// ### Platform-specific
+    ///
+    /// - **Android / iOS / Web:** The data is available only after the drop; a fetch made before
+    ///   it is answered after [`DragDropped`](crate::event::WindowEvent::DragDropped).
     fn fetch_data_transfer(
         &self,
         id: DataTransferId,
@@ -320,6 +325,27 @@ pub trait ActiveEventLoop: Any + fmt::Debug {
     ///   without an icon. A target that does not answer a position within 2 seconds is left,
     ///   and a drop that is not finished within 10 seconds ends in
     ///   [`OutgoingDragCanceled`](crate::event::WindowEvent::OutgoingDragCanceled).
+    /// - **Android:** Text, HTML and a URI list of `content:` URIs are sent; bytes, image and
+    ///   audio types are not, and `file:` URIs return an error. Only [`DndAction::Copy`] and
+    ///   [`DndAction::Move`] are offered. A foreign target always reports copy, since Android has
+    ///   no drag actions; move is reported only by a winit target that accepted move. `icon` must
+    ///   be an [`RgbaIcon`](crate::icon::RgbaIcon) of at most 1024 by 1024 pixels.
+    /// - **iOS:** A drag starts only with the system lift gesture. This method arms the drag while
+    ///   a touch of `source` is down and returns its ID, and the next lift in that window starts
+    ///   it; otherwise an error is returned. The last touch ending without a lift cancels it with
+    ///   [`OutgoingDragCanceled`](crate::event::WindowEvent::OutgoingDragCanceled). Only
+    ///   [`DndAction::Copy`] and [`DndAction::Move`] are used, and move reaches only targets in the
+    ///   same application. `icon` must be an [`RgbaIcon`](crate::icon::RgbaIcon).
+    /// - **Web:** Only works while a mouse button is held on the canvas of `source`, typically
+    ///   from the handler of the `PointerButton` press; otherwise an error is returned. Only text
+    ///   types (plain text, HTML, URI list, RTF) are sent. `icon` must be an
+    ///   [`RgbaIcon`](crate::icon::RgbaIcon). The reported action is the `dropEffect` of the
+    ///   target. No pointer events reach the application during the drag, including the button
+    ///   release.
+    ///
+    /// On every platform a [`DndAction::Move`] reported by
+    /// [`OutgoingDragDropped`](crate::event::WindowEvent::OutgoingDragDropped) leaves the
+    /// deletion of the source data to the application.
     ///
     /// ### Returns
     ///
@@ -393,6 +419,9 @@ pub enum DndAction {
     /// - Wayland
     /// - macOS
     /// - Windows
+    /// - Android (reported by winit targets only, a report without deletion)
+    /// - iOS (within the same application)
+    /// - Web (a report without deletion)
     Move,
     /// Copy the dragged item from the source to the destination.
     ///
@@ -402,6 +431,9 @@ pub enum DndAction {
     /// - Wayland
     /// - macOS
     /// - Windows
+    /// - Android
+    /// - iOS
+    /// - Web
     Copy,
     /// A link is established between the source and the destination.
     ///
@@ -409,6 +441,7 @@ pub enum DndAction {
     ///
     /// - macOS
     /// - Windows
+    /// - Web
     Link,
     /// The user will be prompted for what should be done
     ///

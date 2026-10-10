@@ -6,13 +6,16 @@ use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, available, define_class, msg_send, sel};
 use objc2_core_foundation::{CGFloat, CGPoint, CGRect};
-use objc2_foundation::{NSObject, NSSet, NSString};
+use objc2_foundation::{NSArray, NSObject, NSSet, NSString};
 use objc2_ui_kit::{
+    UIDragDropSession, UIDragInteraction, UIDragInteractionDelegate, UIDragItem, UIDragSession,
+    UIDropInteraction, UIDropInteractionDelegate, UIDropOperation, UIDropProposal, UIDropSession,
     UIEvent, UIForceTouchCapability, UIGestureRecognizer, UIGestureRecognizerDelegate,
     UIGestureRecognizerState, UIKeyInput, UIPanGestureRecognizer, UIPinchGestureRecognizer,
-    UIResponder, UIRotationGestureRecognizer, UITapGestureRecognizer, UITextInputTraits, UITouch,
-    UITouchPhase, UITouchType, UITraitEnvironment, UIView,
+    UIResponder, UIRotationGestureRecognizer, UITapGestureRecognizer, UITargetedDragPreview,
+    UITextInputTraits, UITouch, UITouchPhase, UITouchType, UITraitEnvironment, UIView,
 };
+use winit_core::window::WindowId;
 use tracing::{debug, debug_span, trace_span};
 use winit_core::event::{
     ButtonSource, ElementState, FingerId, Force, KeyEvent, PointerKind, PointerSource,
@@ -20,8 +23,9 @@ use winit_core::event::{
 };
 use winit_core::keyboard::{Key, KeyCode, KeyLocation, NamedKey, NativeKeyCode, PhysicalKey};
 
-use super::app_state::{self, EventWrapper};
+use super::app_state::{self, AppState, EventWrapper};
 use super::window::WinitUIWindow;
+use crate::dnd;
 
 pub struct WinitViewState {
     pinch_gesture_recognizer: RefCell<Option<Retained<UIPinchGestureRecognizer>>>,
@@ -36,6 +40,7 @@ pub struct WinitViewState {
 
     primary_finger: Cell<Option<FingerId>>,
     fingers: Cell<u8>,
+    pencil_down: Cell<bool>,
 }
 
 define_class!(
@@ -330,6 +335,124 @@ define_class!(
         }
     }
 
+    unsafe impl UIDropInteractionDelegate for WinitView {
+        #[unsafe(method(dropInteraction:canHandleSession:))]
+        fn drop_can_handle(
+            &self,
+            _interaction: &UIDropInteraction,
+            _session: &ProtocolObject<dyn UIDropSession>,
+        ) -> bool {
+            true
+        }
+
+        #[unsafe(method(dropInteraction:sessionDidEnter:))]
+        fn drop_did_enter(
+            &self,
+            _interaction: &UIDropInteraction,
+            session: &ProtocolObject<dyn UIDropSession>,
+        ) {
+            let _entered = debug_span!("dropInteraction:sessionDidEnter:").entered();
+            if let Some(window_id) = self.window_id() {
+                dnd::drop_entered(MainThreadMarker::from(self), window_id, self, session);
+            }
+        }
+
+        #[unsafe(method_id(dropInteraction:sessionDidUpdate:))]
+        fn drop_did_update(
+            &self,
+            _interaction: &UIDropInteraction,
+            session: &ProtocolObject<dyn UIDropSession>,
+        ) -> Retained<UIDropProposal> {
+            let _entered = trace_span!("dropInteraction:sessionDidUpdate:").entered();
+            dnd::drop_updated(MainThreadMarker::from(self), self, session)
+        }
+
+        #[unsafe(method(dropInteraction:sessionDidExit:))]
+        fn drop_did_exit(
+            &self,
+            _interaction: &UIDropInteraction,
+            _session: &ProtocolObject<dyn UIDropSession>,
+        ) {
+            let _entered = debug_span!("dropInteraction:sessionDidExit:").entered();
+            dnd::drop_exited(MainThreadMarker::from(self));
+        }
+
+        #[unsafe(method(dropInteraction:performDrop:))]
+        fn drop_perform(
+            &self,
+            _interaction: &UIDropInteraction,
+            session: &ProtocolObject<dyn UIDropSession>,
+        ) {
+            let _entered = debug_span!("dropInteraction:performDrop:").entered();
+            dnd::drop_performed(MainThreadMarker::from(self), self, session);
+        }
+
+        #[unsafe(method(dropInteraction:sessionDidEnd:))]
+        fn drop_did_end(
+            &self,
+            _interaction: &UIDropInteraction,
+            _session: &ProtocolObject<dyn UIDropSession>,
+        ) {
+            let _entered = debug_span!("dropInteraction:sessionDidEnd:").entered();
+            dnd::drop_ended(MainThreadMarker::from(self));
+        }
+    }
+
+    unsafe impl UIDragInteractionDelegate for WinitView {
+        #[unsafe(method_id(dragInteraction:itemsForBeginningSession:))]
+        fn drag_items(
+            &self,
+            _interaction: &UIDragInteraction,
+            _session: &ProtocolObject<dyn UIDragSession>,
+        ) -> Retained<NSArray<UIDragItem>> {
+            let _entered = debug_span!("dragInteraction:itemsForBeginningSession:").entered();
+            match self.window_id() {
+                Some(window_id) => dnd::lift(MainThreadMarker::from(self), window_id),
+                None => NSArray::new(),
+            }
+        }
+
+        #[unsafe(method_id(dragInteraction:previewForLiftingItem:session:))]
+        fn drag_lift_preview(
+            &self,
+            _interaction: &UIDragInteraction,
+            _item: &UIDragItem,
+            session: &ProtocolObject<dyn UIDragSession>,
+        ) -> Option<Retained<UITargetedDragPreview>> {
+            let location = session.locationInView(self);
+            dnd::lift_preview(MainThreadMarker::from(self), self, location)
+        }
+
+        #[unsafe(method(dragInteraction:sessionAllowsMoveOperation:))]
+        fn drag_allows_move(
+            &self,
+            _interaction: &UIDragInteraction,
+            _session: &ProtocolObject<dyn UIDragSession>,
+        ) -> bool {
+            dnd::allows_move(MainThreadMarker::from(self))
+        }
+
+        #[unsafe(method(dragInteraction:sessionIsRestrictedToDraggingApplication:))]
+        fn drag_restricted(
+            &self,
+            _interaction: &UIDragInteraction,
+            _session: &ProtocolObject<dyn UIDragSession>,
+        ) -> bool {
+            false
+        }
+
+        #[unsafe(method(dragInteraction:session:didEndWithOperation:))]
+        fn drag_did_end(
+            &self,
+            _interaction: &UIDragInteraction,
+            _session: &ProtocolObject<dyn UIDragSession>,
+            operation: UIDropOperation,
+        ) {
+            let _entered = debug_span!("dragInteraction:session:didEndWithOperation:").entered();
+            dnd::drag_ended(MainThreadMarker::from(self), operation);
+        }
+    }
+
     unsafe impl UITextInputTraits for WinitView {}
 
     unsafe impl UIKeyInput for WinitView {
@@ -371,10 +494,17 @@ impl WinitView {
 
             primary_finger: Cell::new(None),
             fingers: Cell::new(0),
+            pencil_down: Cell::new(false),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
 
         this.setMultipleTouchEnabled(true);
+
+        let drop = UIDropInteraction::initWithDelegate(mtm.alloc(), ProtocolObject::from_ref(&*this));
+        this.addInteraction(ProtocolObject::from_ref(&*drop));
+        let drag = UIDragInteraction::initWithDelegate(mtm.alloc(), ProtocolObject::from_ref(&*this));
+        drag.setEnabled(true);
+        this.addInteraction(ProtocolObject::from_ref(&*drag));
 
         if let Some(scale_factor) = scale_factor {
             this.setContentScaleFactor(scale_factor as _);
@@ -386,6 +516,14 @@ impl WinitView {
     fn window(&self) -> Option<Retained<WinitUIWindow>> {
         // `WinitView`s should always be installed in a `WinitUIWindow`
         (**self).window().map(|window| window.downcast().unwrap())
+    }
+
+    /// The ID of the window the view is installed in.
+    fn window_id(&self) -> Option<WindowId> {
+        (**self)
+            .window()
+            .and_then(|window| window.downcast::<WinitUIWindow>().ok())
+            .map(|window| window.id())
     }
 
     pub(crate) fn recognize_pinch_gesture(&self, should_recognize: bool) {
@@ -653,7 +791,19 @@ impl WinitView {
             }
         }
         let mtm = MainThreadMarker::new().unwrap();
+        let ivars = self.ivars();
+        for touch in touches {
+            if touch.r#type() == UITouchType::Pencil {
+                ivars.pencil_down.set(matches!(
+                    touch.phase(),
+                    UITouchPhase::Began | UITouchPhase::Moved | UITouchPhase::Stationary
+                ));
+            }
+        }
+
+        let touching = ivars.fingers.get() > 0 || ivars.pencil_down.get();
         app_state::handle_nonuser_events(mtm, touch_events);
+        AppState::get(mtm).dnd().set_touching(window.id(), touching);
     }
 
     fn tablet_tool_data_for_pencil(&self, touch: &UITouch) -> TabletToolData {

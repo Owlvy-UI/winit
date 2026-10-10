@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction};
+use android_activity::input::{Axis, InputEvent, KeyAction, Keycode, MotionAction, MotionEvent, ToolType};
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
 };
@@ -14,13 +14,15 @@ use tracing::{debug, trace, warn};
 use winit_core::application::ApplicationHandler;
 use winit_core::cursor::{Cursor, CustomCursor, CustomCursorSource};
 use winit_core::error::{EventLoopError, NotSupportedError, RequestError};
-use winit_core::event::{self, DeviceId, FingerId, Force, StartCause, SurfaceSizeWriter};
+use winit_core::event::{self, DeviceId, StartCause, SurfaceSizeWriter};
 use winit_core::event_loop::pump_events::PumpStatus;
+use winit_core::data_transfer::{DataTransfer, DataTransferId, DataTransferSend, TransferType};
 use winit_core::event_loop::{
-    ActiveEventLoop as RootActiveEventLoop, ControlFlow, DeviceEvents, EventLoopProvider,
-    EventLoopProxy as CoreEventLoopProxy, EventLoopProxyProvider,
-    OwnedDisplayHandle as CoreOwnedDisplayHandle,
+    ActiveEventLoop as RootActiveEventLoop, AsyncRequestSerial, ControlFlow, DeviceEvents,
+    DndAction, DragIcon, EventLoopProvider, EventLoopProxy as CoreEventLoopProxy,
+    EventLoopProxyProvider, OwnedDisplayHandle as CoreOwnedDisplayHandle,
 };
+use winit_core::icon::RgbaIcon;
 use winit_core::monitor::{Fullscreen, MonitorHandle as CoreMonitorHandle};
 use winit_core::window::{
     self, CursorGrabMode, ImeCapabilities, ImePurpose, ImeRequest, ImeRequestError,
@@ -28,7 +30,7 @@ use winit_core::window::{
     WindowLevel,
 };
 
-use crate::keycodes;
+use crate::{dnd, drag_and_drop, keycodes, pointer};
 
 static HAS_FOCUS: AtomicBool = AtomicBool::new(true);
 
@@ -107,7 +109,7 @@ pub struct EventLoop {
     running: bool,
     pending_redraw: bool,
     cause: StartCause,
-    primary_pointer: Option<FingerId>,
+    pointers: pointer::Pointers,
     ignore_volume_keys: bool,
     combining_accent: Option<char>,
 }
@@ -143,10 +145,11 @@ impl EventLoop {
         let event_loop_proxy = Arc::new(EventLoopProxy::new(android_app.create_waker()));
 
         let redraw_flag = SharedFlag::new();
+        drag_and_drop::init(android_app.create_waker());
 
         Ok(Self {
             android_app: android_app.clone(),
-            primary_pointer: None,
+            pointers: pointer::Pointers::default(),
             window_target: ActiveEventLoop {
                 app: android_app.clone(),
                 control_flow: Cell::new(ControlFlow::default()),
@@ -225,6 +228,7 @@ impl EventLoop {
                     app.memory_warning(&self.window_target);
                 },
                 MainEvent::Start => {
+                    drag_and_drop::attach(&self.android_app);
                     app.resumed(self.window_target());
                 },
                 MainEvent::Resume { .. } => {
@@ -281,6 +285,14 @@ impl EventLoop {
             },
         }
 
+        for event in self.pointers.finish() {
+            app.window_event(&self.window_target, GLOBAL_WINDOW, event);
+        }
+
+        for event in drag_and_drop::take_events() {
+            app.window_event(&self.window_target, GLOBAL_WINDOW, event);
+        }
+
         if self.window_target.event_loop_proxy.wake_up.swap(false, Ordering::Relaxed) {
             app.proxy_wake_up(&self.window_target);
         }
@@ -321,142 +333,19 @@ impl EventLoop {
         let mut input_status = InputStatus::Handled;
         match event {
             InputEvent::MotionEvent(motion_event) => {
-                let device_id = Some(DeviceId::from_raw(motion_event.device_id() as i64));
-                let action = motion_event.action();
+                if matches!(
+                    motion_event.action(),
+                    MotionAction::HoverEnter | MotionAction::HoverMove | MotionAction::HoverExit
+                ) {
+                    // Hover reaches the view hierarchy, where accessibility
+                    // turns it into the node under the pointer.
+                    input_status = InputStatus::Unhandled;
+                }
 
-                let pointers: Option<
-                    Box<dyn Iterator<Item = android_activity::input::Pointer<'_>>>,
-                > = match action {
-                    MotionAction::Down
-                    | MotionAction::PointerDown
-                    | MotionAction::Up
-                    | MotionAction::PointerUp => Some(Box::new(std::iter::once(
-                        motion_event.pointer_at_index(motion_event.pointer_index()),
-                    ))),
-                    MotionAction::Move | MotionAction::Cancel => {
-                        Some(Box::new(motion_event.pointers()))
-                    },
-                    MotionAction::HoverEnter
-                    | MotionAction::HoverMove
-                    | MotionAction::HoverExit => {
-                        // Hover reaches the view hierarchy, where accessibility
-                        // turns it into the node under the pointer.
-                        input_status = InputStatus::Unhandled;
-                        None
-                    },
-                    // TODO mouse events
-                    _ => None,
-                };
-
-                for pointer in pointers.into_iter().flatten() {
-                    let tool_type = pointer.tool_type();
-                    let position = PhysicalPosition { x: pointer.x() as _, y: pointer.y() as _ };
-                    trace!(
-                        "Input event {device_id:?}, {action:?}, loc={position:?}, \
-                         pointer={pointer:?}, tool_type={tool_type:?}"
-                    );
-                    let finger_id = FingerId::from_raw(pointer.pointer_id() as usize);
-                    let force = Some(Force::Normalized(pointer.pressure() as f64));
-
-                    match action {
-                        MotionAction::Down | MotionAction::PointerDown => {
-                            let primary = action == MotionAction::Down;
-                            if primary {
-                                self.primary_pointer = Some(finger_id);
-                            }
-                            let event = event::WindowEvent::PointerEntered {
-                                device_id,
-                                primary,
-                                position,
-                                kind: match tool_type {
-                                    android_activity::input::ToolType::Finger => {
-                                        event::PointerKind::Touch(finger_id)
-                                    },
-                                    // TODO mouse events
-                                    android_activity::input::ToolType::Mouse => continue,
-                                    _ => event::PointerKind::Unknown,
-                                },
-                            };
-                            app.window_event(&self.window_target, GLOBAL_WINDOW, event);
-                            let event = event::WindowEvent::PointerButton {
-                                device_id,
-                                primary,
-                                state: event::ElementState::Pressed,
-                                position,
-                                button: match tool_type {
-                                    android_activity::input::ToolType::Finger => {
-                                        event::ButtonSource::Touch { finger_id, force }
-                                    },
-                                    // TODO mouse events
-                                    android_activity::input::ToolType::Mouse => continue,
-                                    _ => event::ButtonSource::Unknown(0),
-                                },
-                                is_macos_activation_click: false,
-                            };
-                            app.window_event(&self.window_target, GLOBAL_WINDOW, event);
-                        },
-                        MotionAction::Move => {
-                            let primary = self.primary_pointer == Some(finger_id);
-                            let event = event::WindowEvent::PointerMoved {
-                                device_id,
-                                primary,
-                                position,
-                                source: match tool_type {
-                                    android_activity::input::ToolType::Finger => {
-                                        event::PointerSource::Touch { finger_id, force }
-                                    },
-                                    // TODO mouse events
-                                    android_activity::input::ToolType::Mouse => continue,
-                                    _ => event::PointerSource::Unknown,
-                                },
-                            };
-                            app.window_event(&self.window_target, GLOBAL_WINDOW, event);
-                        },
-                        MotionAction::Up | MotionAction::PointerUp | MotionAction::Cancel => {
-                            let primary = action == MotionAction::Up
-                                || (action == MotionAction::Cancel
-                                    && self.primary_pointer == Some(finger_id));
-
-                            if primary {
-                                self.primary_pointer = None;
-                            }
-
-                            if let MotionAction::Up | MotionAction::PointerUp = action {
-                                let event = event::WindowEvent::PointerButton {
-                                    device_id,
-                                    primary,
-                                    state: event::ElementState::Released,
-                                    position,
-                                    button: match tool_type {
-                                        android_activity::input::ToolType::Finger => {
-                                            event::ButtonSource::Touch { finger_id, force }
-                                        },
-                                        // TODO mouse events
-                                        android_activity::input::ToolType::Mouse => continue,
-                                        _ => event::ButtonSource::Unknown(0),
-                                    },
-                                    is_macos_activation_click: false,
-                                };
-                                app.window_event(&self.window_target, GLOBAL_WINDOW, event);
-                            }
-
-                            let event = event::WindowEvent::PointerLeft {
-                                device_id,
-                                primary,
-                                position: Some(position),
-                                kind: match tool_type {
-                                    android_activity::input::ToolType::Finger => {
-                                        event::PointerKind::Touch(finger_id)
-                                    },
-                                    // TODO mouse events
-                                    android_activity::input::ToolType::Mouse => continue,
-                                    _ => event::PointerKind::Unknown,
-                                },
-                            };
-                            app.window_event(&self.window_target, GLOBAL_WINDOW, event);
-                        },
-                        _ => unreachable!(),
-                    }
+                let motion = motion_of(motion_event);
+                trace!("Input event {motion:?}");
+                for event in self.pointers.handle(&motion) {
+                    app.window_event(&self.window_target, GLOBAL_WINDOW, event);
                 }
             },
             InputEvent::KeyEvent(key) => {
@@ -611,9 +500,14 @@ impl EventLoop {
                     // a wake up here so we can ignore the wake up if there are no events/requests.
                     // We also ignore wake ups while suspended.
                     self.pending_redraw |= self.redraw_flag.get_and_reset();
-                    if !self.running
-                        || (!self.pending_redraw
-                            && !self.window_target.event_loop_proxy.wake_up.load(Ordering::Relaxed))
+                    if !drag_and_drop::pending()
+                        && (!self.running
+                            || (!self.pending_redraw
+                                && !self
+                                    .window_target
+                                    .event_loop_proxy
+                                    .wake_up
+                                    .load(Ordering::Relaxed)))
                     {
                         return;
                     }
@@ -781,6 +675,123 @@ impl RootActiveEventLoop for ActiveEventLoop {
 
     fn rwh_06_handle(&self) -> &dyn rwh_06::HasDisplayHandle {
         self
+    }
+
+    fn fetch_data_transfer(
+        &self,
+        id: DataTransferId,
+        type_: &dyn TransferType,
+    ) -> Result<AsyncRequestSerial, RequestError> {
+        dnd_result(drag_and_drop::with_dnd(|dnd| dnd.fetch(id, type_)))
+    }
+
+    fn data_transfer(&self, id: DataTransferId) -> Result<Box<dyn DataTransfer>, RequestError> {
+        dnd_result(drag_and_drop::with_dnd(|dnd| dnd.data_transfer(id)))
+    }
+
+    fn set_valid_dnd_actions(
+        &self,
+        id: DataTransferId,
+        actions: &[DndAction],
+    ) -> Result<(), RequestError> {
+        dnd_result(drag_and_drop::with_dnd(|dnd| dnd.set_valid(id, actions)))
+    }
+
+    fn start_drag(
+        &self,
+        source: WindowId,
+        send_data: Box<dyn DataTransferSend>,
+        actions: &[DndAction],
+        icon: Option<DragIcon>,
+    ) -> Result<DataTransferId, RequestError> {
+        if source != GLOBAL_WINDOW {
+            return Err(RequestError::Ignored);
+        }
+
+        let clip = dnd_result(Some(dnd::outgoing_clip(&*send_data, actions)))?;
+        let shadow = icon.as_ref().and_then(drag_shadow);
+        let id = drag_and_drop::with_dnd(dnd::Dnd::start).ok_or(RequestError::Ignored)?;
+        if let Err(error) = drag_and_drop::start(&self.app, id.into_raw(), &clip, shadow.as_ref()) {
+            warn!("the drag could not be handed to the UI thread: {error}");
+            drag_and_drop::with_dnd(|dnd| dnd.abandon(id));
+            return Err(RequestError::Ignored);
+        }
+
+        Ok(id)
+    }
+}
+
+/// Copies what the pointers need out of a motion event.
+fn motion_of(event: &MotionEvent<'_>) -> pointer::Motion {
+    let phase = match event.action() {
+        MotionAction::Down | MotionAction::PointerDown => {
+            pointer::Phase::Down(event.pointer_index())
+        },
+        MotionAction::Up | MotionAction::PointerUp => pointer::Phase::Up(event.pointer_index()),
+        MotionAction::Move => pointer::Phase::Move,
+        MotionAction::Cancel => pointer::Phase::Cancel,
+        MotionAction::HoverEnter => pointer::Phase::HoverEnter,
+        MotionAction::HoverMove => pointer::Phase::HoverMove,
+        MotionAction::HoverExit => pointer::Phase::HoverExit,
+        MotionAction::ButtonPress | MotionAction::ButtonRelease => pointer::Phase::Button,
+        MotionAction::Scroll => pointer::Phase::Scroll,
+        _ => pointer::Phase::Other,
+    };
+    let contacts = event
+        .pointers()
+        .map(|pointer| pointer::Contact {
+            id: usize::try_from(pointer.pointer_id()).unwrap_or(usize::MAX),
+            tool: match pointer.tool_type() {
+                ToolType::Finger => pointer::Tool::Finger,
+                ToolType::Mouse => pointer::Tool::Mouse,
+                ToolType::Stylus => pointer::Tool::Stylus,
+                ToolType::Eraser => pointer::Tool::Eraser,
+                _ => pointer::Tool::Unknown,
+            },
+            position: PhysicalPosition::new(f64::from(pointer.x()), f64::from(pointer.y())),
+            pressure: pointer.pressure(),
+            tilt: pointer.axis_value(Axis::Tilt),
+            orientation: pointer.orientation(),
+            hscroll: pointer.axis_value(Axis::Hscroll),
+            vscroll: pointer.axis_value(Axis::Vscroll),
+        })
+        .collect();
+
+    pointer::Motion {
+        device: i64::from(event.device_id()),
+        phase,
+        buttons: event.button_state().0,
+        contacts,
+    }
+}
+
+/// The shadow of a drag icon, which must be an [`RgbaIcon`].
+fn drag_shadow(icon: &DragIcon) -> Option<dnd::Shadow> {
+    let Some(rgba) = icon.icon.cast_ref::<RgbaIcon>() else {
+        warn!("DragIcon::icon must be an RgbaIcon on Android; ignoring");
+        return None;
+    };
+
+    let shadow =
+        dnd::shadow(rgba.buffer(), rgba.width(), rgba.height(), icon.offset_x, icon.offset_y);
+    if shadow.is_none() {
+        warn!("the drag icon is empty or larger than {0}x{0}; ignoring", dnd::MAX_SHADOW_SIDE);
+    }
+
+    shadow
+}
+
+/// Turns the answer of the drag state into the error a request returns.
+fn dnd_result<T>(result: Option<Result<T, dnd::DndError>>) -> Result<T, RequestError> {
+    match result {
+        Some(Ok(value)) => Ok(value),
+        Some(Err(
+            dnd::DndError::UnknownTransfer
+            | dnd::DndError::UnknownType
+            | dnd::DndError::TooManyFetches,
+        ))
+        | None => Err(RequestError::Ignored),
+        Some(Err(error)) => Err(NotSupportedError::new(error.message()).into()),
     }
 }
 

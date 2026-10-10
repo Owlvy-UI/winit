@@ -18,12 +18,14 @@ use winit_common::foundation::create_observer;
 use winit_core::application::ApplicationHandler;
 use winit_core::cursor::{CustomCursor, CustomCursorSource};
 use winit_core::error::{EventLoopError, NotSupportedError, RequestError};
+use winit_core::data_transfer::{DataTransfer, DataTransferId, DataTransferSend, TransferType};
 use winit_core::event_loop::{
-    ActiveEventLoop as RootActiveEventLoop, ControlFlow, DeviceEvents, EventLoopProvider,
-    EventLoopProxy as CoreEventLoopProxy, OwnedDisplayHandle as CoreOwnedDisplayHandle,
+    ActiveEventLoop as RootActiveEventLoop, AsyncRequestSerial, ControlFlow, DeviceEvents,
+    DndAction, DragIcon, EventLoopProvider, EventLoopProxy as CoreEventLoopProxy,
+    OwnedDisplayHandle as CoreOwnedDisplayHandle,
 };
 use winit_core::monitor::MonitorHandle as CoreMonitorHandle;
-use winit_core::window::{Theme, Window as CoreWindow};
+use winit_core::window::{Theme, Window as CoreWindow, WindowId};
 
 use super::app_state::{AppState, send_occluded_event_for_all_windows};
 use crate::monitor::MonitorHandle;
@@ -98,6 +100,36 @@ impl RootActiveEventLoop for ActiveEventLoop {
 
     fn rwh_06_handle(&self) -> &dyn rwh_06::HasDisplayHandle {
         self
+    }
+
+    fn fetch_data_transfer(
+        &self,
+        id: DataTransferId,
+        type_: &dyn TransferType,
+    ) -> Result<AsyncRequestSerial, RequestError> {
+        Ok(AppState::get(self.mtm).dnd().fetch(id, type_)?)
+    }
+
+    fn data_transfer(&self, id: DataTransferId) -> Result<Box<dyn DataTransfer>, RequestError> {
+        Ok(AppState::get(self.mtm).dnd().data_transfer(id)?)
+    }
+
+    fn set_valid_dnd_actions(
+        &self,
+        id: DataTransferId,
+        actions: &[DndAction],
+    ) -> Result<(), RequestError> {
+        Ok(AppState::get(self.mtm).dnd().set_valid_actions(id, actions)?)
+    }
+
+    fn start_drag(
+        &self,
+        source: WindowId,
+        send_data: Box<dyn DataTransferSend>,
+        actions: &[DndAction],
+        icon: Option<DragIcon>,
+    ) -> Result<DataTransferId, RequestError> {
+        Ok(AppState::get(self.mtm).dnd().arm(source, send_data, actions, icon)?)
     }
 }
 

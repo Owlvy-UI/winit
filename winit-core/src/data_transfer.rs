@@ -234,8 +234,8 @@ fn default_try_as_file_paths<T: TypedData + ?Sized>(data: &T) -> io::Result<Vec<
 
 // Replicates the cfg for `url::Url::parse`
 //
-// It doesn't matter that this is unimplemented on the web, as we don't currently support
-// drag-and-drop for web targets and the web platform can't directly access paths anyway.
+// The web has no file paths; dropped files are delivered as bytes, see
+// `winit_web::WebTransferType`.
 #[cfg(not(any(unix, windows, target_os = "redox", target_os = "wasi", target_os = "hermit")))]
 fn default_try_as_file_paths<T: TypedData + ?Sized>(_: &T) -> io::Result<Vec<PathBuf>> {
     Err(io::ErrorKind::Unsupported.into())
@@ -431,9 +431,7 @@ impl SendData {
 
         // Replicates the cfg for `url::Url::from_file_path`
         //
-        // It doesn't matter that this is unimplemented on the web, as we don't currently support
-        // drag-and-drop for web targets and the web platform can't directly access paths
-        // anyway.
+        // The web has no file paths; a drag from the web sends text types only.
         #[cfg(not(any(
             unix,
             windows,

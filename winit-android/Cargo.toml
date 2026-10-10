@@ -25,6 +25,7 @@ winit-core.workspace = true
 # Platform-specific
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity.workspace = true
+jni.workspace = true
 ndk.workspace = true
 
 [dev-dependencies]

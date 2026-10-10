@@ -23,6 +23,7 @@ use winit_core::event::{StartCause, SurfaceSizeWriter, WindowEvent};
 use winit_core::event_loop::ControlFlow;
 use winit_core::window::WindowId;
 
+use crate::dnd::DndState;
 use crate::event_loop::ActiveEventLoop;
 use crate::window::WinitUIWindow;
 
@@ -83,6 +84,7 @@ pub(crate) struct AppState {
     event_loop_proxy: Arc<EventLoopProxy>,
     queued_events: Cell<Vec<EventWrapper>>,
     queued_gpu_redraws: Cell<HashSet<Retained<WinitUIWindow>>>,
+    dnd: DndState,
 }
 
 impl fmt::Debug for AppState {
@@ -116,12 +118,18 @@ impl AppState {
                 event_loop_proxy,
                 queued_events: Cell::new(Vec::new()),
                 queued_gpu_redraws: Cell::new(HashSet::new()),
+                dnd: DndState::default(),
             })
             .is_ok()
     }
 
     pub(crate) fn get(mtm: MainThreadMarker) -> &'static Self {
         GLOBAL.get(mtm).get().expect("tried to get application state before it was registered")
+    }
+
+    /// The drag and drop state.
+    pub(crate) fn dnd(&self) -> &DndState {
+        &self.dnd
     }
 
     fn has_launched(&self) -> bool {
