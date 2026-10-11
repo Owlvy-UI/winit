@@ -45,6 +45,7 @@ use crate::dnd::Dnd;
 use crate::drag_source::DragSources;
 use crate::event_processor::{EventProcessor, MAX_MOD_REPLAY_LEN};
 use crate::ime::{self, Ime, ImeCreationError, ImeSender};
+use crate::tablet;
 use crate::util::{self, CustomCursor};
 use crate::window::{UnownedWindow, Window};
 use crate::xdisplay::{XConnection, XError, XNotSupported};
@@ -1182,6 +1183,8 @@ pub struct Device {
     // For slave devices, this is the master.
     pub(crate) attachment: c_int,
     pub(crate) r#type: DeviceType,
+    /// The valuators of a pen.
+    pub(crate) tablet: tablet::TabletAxes,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1210,6 +1213,7 @@ impl Device {
         let name = unsafe { CStr::from_ptr(info.name).to_string_lossy() };
         let mut scroll_axes = Vec::new();
         let mut r#type = None;
+        let mut tablet_axes = tablet::TabletAxes::default();
 
         if Device::physical_device(info) {
             // Identify scroll axes
@@ -1228,9 +1232,22 @@ impl Device {
                     }));
                 } else if ty == ffi::XITouchClass {
                     r#type = Some(DeviceType::Touch);
-                } else if r#type.is_none() && ty == ffi::XIValuatorClass {
+                } else if ty == ffi::XIValuatorClass {
                     let info = unsafe { &*(class_ptr as *const ffi::XIValuatorClassInfo) };
                     let atom = info.label as xproto::Atom;
+                    let axis =
+                        Some(tablet::Axis { number: info.number, min: info.min, max: info.max });
+                    if atom == atoms[ABS_PRESSURE] {
+                        tablet_axes.pressure = axis;
+                    } else if atom == atoms[ABS_TILT_X] {
+                        tablet_axes.tilt_x = axis;
+                    } else if atom == atoms[ABS_TILT_Y] {
+                        tablet_axes.tilt_y = axis;
+                    }
+
+                    if r#type.is_some() {
+                        continue;
+                    }
 
                     // Absolute X/Y axes alone do not identify a stylus:
                     // emulated pointing devices in virtual machines (the
@@ -1259,6 +1276,7 @@ impl Device {
             scroll_axes,
             attachment: info.attachment,
             r#type: r#type.unwrap_or(DeviceType::Mouse),
+            tablet: tablet_axes,
         };
         device.reset_scroll_position(info);
         device

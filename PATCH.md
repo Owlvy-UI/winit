@@ -355,3 +355,55 @@ Observed in Waydroid: `input mouse tap` and `input mouse swipe` report a mouse
 with `Left`, `input stylus swipe` a pen with its contact. Hover and scroll could
 not be injected there: the shell `input` of Android 13 has no hover action or
 scroll command, and the shell user cannot open `/dev/uhid`.
+
+## 13. Pens report the same events on every desktop
+
+Every backend reports a pen in this order: `PointerEntered` when it comes into
+range, `PointerMoved` with `PointerSource::TabletTool` while it hovers or
+touches, `PointerButton` with `TabletToolButton::Contact` for the tip,
+`Barrel` for the first button on the side and `Other(n)` for further ones, and
+`PointerLeft` only when it goes out of range. An eraser end is
+`TabletToolKind::Eraser`, never a button.
+
+Windows (`winit-win32/src/pen.rs`, unit tested, `event_loop.rs`, `window.rs`):
+
+- Pen messages, `WM_POINTERLEAVE` included, are compared with the flags of the
+  last one (`POINTER_FLAG_INRANGE`, `POINTER_FLAG_INCONTACT`, `PEN_FLAG_BARREL`,
+  `PEN_FLAG_INVERTED`, `PEN_FLAG_ERASER`) and the changes are reported in the
+  order above. Upstream sent `PointerLeft` on every lift, reported the eraser
+  as `TabletToolButton::Other(4)` (which `mouse_button` turns into `Forward`)
+  and reported a press with the barrel held as a barrel press instead of a
+  contact.
+- An inverted pen is `TabletToolKind::Eraser`. Turning the pen round leaves with
+  the old kind and enters with the new one.
+- Pointer messages are answered with 0, so Windows does not promote them to
+  mouse messages and a pen arrives once.
+
+macOS (`winit-appkit/src/view.rs`): upstream reported a tablet as a mouse.
+
+- `tabletProximity:` emits `PointerEntered` and `PointerLeft` with the kind of
+  `pointingDeviceType` (pen, eraser, or `Mouse` for a tablet puck) and keeps the
+  kind for the following events.
+- Mouse events with the subtype `tabletPoint` report `TabletTool` with
+  `pressure` as normalized force and `tilt` in degrees (y turned to point
+  towards the user). The left button is `Contact`, the right one `Barrel`.
+
+X11 (`winit-x11/src/tablet.rs`, unit tested, `event_loop.rs`,
+`event_processor.rs`): upstream dropped all motion and buttons of a device it
+identified as a pen or eraser.
+
+- The valuators labelled `Abs Pressure`, `Abs Tilt X` and `Abs Tilt Y` are kept
+  per device with their range. Motion reports `TabletTool` with pressure as a
+  share of its range and tilt mapped onto -90 to 90 degrees. A valuator absent
+  from an event keeps its last value.
+- Button 1 is `Contact`, 2 `Barrel`, 3 `Other(1)`. `PointerLeft` carries the
+  tablet kind when the source device is a pen. X11 reports no proximity, so a
+  pen leaves when it leaves the window.
+
+Wayland (`winit-wayland/src/types/wp_tablet_input_v2.rs`): `BTN_STYLUS` was
+reported as `Contact`, so the side button acted as the tip. It is `Barrel` now,
+`BTN_STYLUS2` `Other(1)` and `BTN_STYLUS3` `Other(2)`.
+
+Checked: unit tests for Windows (compiled, not run: no MinGW `dlltool` on the
+build machine), X11 (run). clippy for Windows, macOS, X11 and Wayland. No pen
+or tablet was available, so none of this ran against hardware.

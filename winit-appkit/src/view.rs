@@ -9,8 +9,8 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{AnyThread, DefinedClass, MainThreadMarker, Message, define_class, msg_send};
 use objc2_app_kit::{
     NSApplication, NSCursor, NSDragOperation, NSDraggingSession, NSEvent, NSEventPhase,
-    NSResponder, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSView,
-    NSViewLayerContentsRedrawPolicy, NSWindow,
+    NSEventSubtype, NSPointingDeviceType, NSResponder, NSTextInputClient, NSTrackingArea,
+    NSTrackingAreaOptions, NSView, NSViewLayerContentsRedrawPolicy, NSWindow,
 };
 use objc2_core_foundation::CGRect;
 use objc2_foundation::{
@@ -19,8 +19,9 @@ use objc2_foundation::{
 };
 use tracing::{debug_span, trace_span};
 use winit_core::event::{
-    DeviceEvent, ElementState, Ime, KeyEvent, Modifiers, MouseButton, MouseScrollDelta,
-    PointerKind, PointerSource, TouchPhase, WindowEvent,
+    ButtonSource, DeviceEvent, ElementState, Force, Ime, KeyEvent, Modifiers, MouseButton,
+    MouseScrollDelta, PointerKind, PointerSource, TabletToolButton, TabletToolData,
+    TabletToolKind, TabletToolTilt, TouchPhase, WindowEvent,
 };
 use winit_core::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey};
 use winit_core::window::ImeCapabilities;
@@ -145,6 +146,8 @@ pub struct ViewState {
     /// Set by `acceptsFirstMouse:` so the next `mouseDown:` can tag its
     /// [`WindowEvent::PointerButton`] with `is_macos_activation_click: true`.
     next_click_is_activation: Cell<bool>,
+    /// The tool of a tablet in proximity, from the last `tabletProximity:`.
+    tablet_tool: Cell<Option<TabletToolKind>>,
 
     /// The state of the `Option` as `Alt`.
     option_as_alt: Cell<OptionAsAlt>,
@@ -659,6 +662,12 @@ define_class!(
             self.mouse_motion(event);
         }
 
+        #[unsafe(method(tabletProximity:))]
+        fn tablet_proximity(&self, event: &NSEvent) {
+            let _entered = debug_span!("tabletProximity:").entered();
+            self.tablet_proximity_changed(event);
+        }
+
         #[unsafe(method(mouseEntered:))]
         fn mouse_entered(&self, event: &NSEvent) {
             let _entered = debug_span!("mouseEntered:").entered();
@@ -838,6 +847,7 @@ impl WinitView {
             forward_key_to_app: Default::default(),
             marked_text: Default::default(),
             next_click_is_activation: Default::default(),
+            tablet_tool: Default::default(),
             option_as_alt: Cell::new(option_as_alt),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
@@ -1197,14 +1207,55 @@ impl WinitView {
                 ElementState::Released => self.ivars().next_click_is_activation.replace(false),
             };
 
+        let button = match self.tablet_point(event) {
+            Some((kind, data)) => {
+                ButtonSource::TabletTool { kind, button: tablet_button(button), data }
+            },
+            None => button.into(),
+        };
+
         self.queue_event(WindowEvent::PointerButton {
             device_id: None,
             primary: true,
             state: button_state,
             position,
-            button: button.into(),
+            button,
             is_macos_activation_click,
         });
+    }
+
+    /// The tool and its data when a mouse event comes from a tablet.
+    fn tablet_point(&self, event: &NSEvent) -> Option<(TabletToolKind, TabletToolData)> {
+        if event.subtype() != NSEventSubtype::TabletPoint {
+            return None;
+        }
+
+        let kind = self.ivars().tablet_tool.get().unwrap_or(TabletToolKind::Pen);
+        Some((kind, tablet_data(event.pressure(), event.tilt())))
+    }
+
+    /// Follows a tablet tool coming into or leaving proximity.
+    fn tablet_proximity_changed(&self, event: &NSEvent) {
+        let position = self.mouse_view_point(event).to_physical(self.scale_factor());
+        let kind = tablet_kind(event.pointingDeviceType());
+
+        if event.isEnteringProximity() {
+            self.ivars().tablet_tool.set(Some(kind));
+            self.queue_event(WindowEvent::PointerEntered {
+                device_id: None,
+                primary: true,
+                position,
+                kind: PointerKind::TabletTool(kind),
+            });
+        } else {
+            let kind = self.ivars().tablet_tool.take().unwrap_or(kind);
+            self.queue_event(WindowEvent::PointerLeft {
+                device_id: None,
+                primary: true,
+                position: Some(position),
+                kind: PointerKind::TabletTool(kind),
+            });
+        }
     }
 
     fn mouse_motion(&self, event: &NSEvent) {
@@ -1225,11 +1276,16 @@ impl WinitView {
 
         self.update_modifiers(event, false);
 
+        let source = match self.tablet_point(event) {
+            Some((kind, data)) => PointerSource::TabletTool { kind, data },
+            None => PointerSource::Mouse,
+        };
+
         self.queue_event(WindowEvent::PointerMoved {
             device_id: None,
             primary: true,
             position: view_point.to_physical(self.scale_factor()),
-            source: PointerSource::Mouse,
+            source,
         });
     }
 
@@ -1238,6 +1294,38 @@ impl WinitView {
         let view_point = self.convertPoint_fromView(window_point, None);
 
         LogicalPosition::new(view_point.x, view_point.y)
+    }
+}
+
+/// The tool kind of an `NSPointingDeviceType`.
+fn tablet_kind(device: NSPointingDeviceType) -> TabletToolKind {
+    if device == NSPointingDeviceType::Eraser {
+        TabletToolKind::Eraser
+    } else if device == NSPointingDeviceType::Cursor {
+        TabletToolKind::Mouse
+    } else {
+        TabletToolKind::Pen
+    }
+}
+
+/// The tablet button a mouse button of a tablet point stands for: the tip
+/// clicks left, the barrel button right.
+fn tablet_button(button: MouseButton) -> TabletToolButton {
+    match button {
+        MouseButton::Left => TabletToolButton::Contact,
+        MouseButton::Right => TabletToolButton::Barrel,
+        _ => TabletToolButton::Other(1),
+    }
+}
+
+/// The data of a tablet point: `pressure` from 0 to 1, `tilt` from -1 to 1
+/// with y pointing up.
+fn tablet_data(pressure: f32, tilt: NSPoint) -> TabletToolData {
+    let degrees = |value: f64| (value.clamp(-1.0, 1.0) * 90.0).round() as i8;
+    TabletToolData {
+        force: Some(Force::Normalized(f64::from(pressure).clamp(0.0, 1.0))),
+        tilt: Some(TabletToolTilt { x: degrees(tilt.x as f64), y: degrees(-(tilt.y as f64)) }),
+        ..TabletToolData::default()
     }
 }
 

@@ -43,7 +43,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     EnumThreadWindows, GW_OWNER, GWL_STYLE, GWL_USERDATA, GetClientRect, GetCursorPos, GetMenu,
     GetWindow, HTCAPTION, HTCLIENT, LoadCursorW, MINMAXINFO, MNC_CLOSE, MSG, MWMO_INPUTAVAILABLE,
-    MsgWaitForMultipleObjectsEx, NCCALCSIZE_PARAMS, PEN_FLAG_BARREL, PEN_FLAG_ERASER,
+    MsgWaitForMultipleObjectsEx, NCCALCSIZE_PARAMS,
     PEN_MASK_PRESSURE, PEN_MASK_ROTATION, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PM_REMOVE, PT_PEN,
     PT_TOUCH, PeekMessageW, PostMessageW, QS_ALLINPUT, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL,
     RegisterClassExW, RegisterWindowMessageA, SC_MINIMIZE, SC_RESTORE, SIZE_MAXIMIZED,
@@ -54,7 +54,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_INPUT, WM_INPUTLANGCHANGE, WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MENUCHAR,
     WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCCREATE,
-    WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_PAINT, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
+    WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_PAINT, WM_POINTERDOWN, WM_POINTERLEAVE, WM_POINTERUP,
+    WM_POINTERUPDATE,
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SIZING,
     WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TOUCH, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
     WM_XBUTTONDOWN, WM_XBUTTONUP, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT,
@@ -69,8 +70,8 @@ use winit_core::data_transfer::{
 };
 use winit_core::error::{EventLoopError, NotSupportedError, RequestError};
 use winit_core::event::{
-    DeviceEvent, DeviceId, FingerId, Force, Ime, RawKeyEvent, SurfaceSizeWriter, TabletToolButton,
-    TabletToolData, TabletToolKind, TabletToolTilt, TouchPhase, WindowEvent,
+    DeviceEvent, DeviceId, FingerId, Force, Ime, RawKeyEvent, SurfaceSizeWriter, TabletToolData,
+    TabletToolTilt, TouchPhase, WindowEvent,
 };
 use winit_core::event_loop::pump_events::PumpStatus;
 use winit_core::event_loop::{
@@ -92,6 +93,7 @@ use crate::event_loop::runner::PendingDrag;
 use crate::icon::WinCursor;
 use crate::ime::ImeContext;
 use crate::keyboard::KeyEventBuilder;
+use crate::pen::{self, PenChange, PenSnapshot};
 use crate::keyboard_layout::LAYOUT_CACHE;
 use crate::monitor::{self, MonitorHandle};
 use crate::util::{WIN10_BUILD_VERSION, wrap_device_id};
@@ -112,7 +114,7 @@ pub(crate) struct WindowData {
     pub key_event_builder: KeyEventBuilder,
     pub _file_drop_handler: Option<FileDropHandler>,
     pub userdata_removed: Cell<bool>,
-    pub last_tablet_down_button_state: Cell<u32>,
+    pub last_pen: Cell<PenSnapshot>,
     pub recurse_depth: Cell<u32>,
 }
 
@@ -2120,7 +2122,7 @@ unsafe fn public_window_callback_inner(
             result = ProcResult::Value(0);
         },
 
-        WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP => {
+        WM_POINTERDOWN | WM_POINTERUPDATE | WM_POINTERUP | WM_POINTERLEAVE => {
             use winit_core::event::ElementState::{Pressed, Released};
             use winit_core::event::{ButtonSource, PointerKind, PointerSource};
 
@@ -2215,6 +2217,54 @@ unsafe fn public_window_callback_inner(
                     let finger_id = FingerId::from_raw(pointer_info.pointerId as usize);
                     let primary = util::has_flag(pointer_info.pointerFlags, POINTER_FLAG_PRIMARY);
 
+                    if pointer_info.pointerType == PT_PEN {
+                        let (pen_flags, data) = tablet_tool_info_for_pen(pointer_info.pointerId);
+                        let now = PenSnapshot::of(
+                            pointer_info.pointerFlags,
+                            pen_flags,
+                            msg == WM_POINTERLEAVE,
+                        );
+                        let before = userdata.last_pen.replace(now);
+                        for change in pen::changes(before, now) {
+                            let event = match change {
+                                PenChange::Entered(kind) => WindowEvent::PointerEntered {
+                                    device_id: None,
+                                    primary,
+                                    position,
+                                    kind: PointerKind::TabletTool(kind),
+                                },
+                                PenChange::Moved(kind) => WindowEvent::PointerMoved {
+                                    device_id: None,
+                                    primary,
+                                    position,
+                                    source: PointerSource::TabletTool { kind, data: data.clone() },
+                                },
+                                PenChange::Button(kind, button, state) => {
+                                    WindowEvent::PointerButton {
+                                        device_id: None,
+                                        primary,
+                                        state,
+                                        position,
+                                        button: ButtonSource::TabletTool {
+                                            kind,
+                                            button,
+                                            data: data.clone(),
+                                        },
+                                        is_macos_activation_click: false,
+                                    }
+                                },
+                                PenChange::Left(kind) => WindowEvent::PointerLeft {
+                                    device_id: None,
+                                    primary,
+                                    position: Some(position),
+                                    kind: PointerKind::TabletTool(kind),
+                                },
+                            };
+                            userdata.send_window_event(window, event);
+                        }
+                        continue;
+                    }
+
                     let is_down = util::has_flag(pointer_info.pointerFlags, POINTER_FLAG_DOWN);
                     if is_down || util::has_flag(pointer_info.pointerFlags, POINTER_FLAG_UP) {
                         let (kind, button) = match pointer_info.pointerType {
@@ -2222,25 +2272,6 @@ unsafe fn public_window_callback_inner(
                                 finger_id,
                                 force: force_for_touch(pointer_info.pointerId),
                             }),
-                            PT_PEN => {
-                                let kind = PointerKind::TabletTool(TabletToolKind::Pen);
-                                let (mut pen_flags, data) =
-                                    tablet_tool_info_for_pen(pointer_info.pointerId);
-                                let old_pen_flags =
-                                    userdata.last_tablet_down_button_state.replace(pen_flags);
-                                // For release, use a diff.
-                                if !is_down {
-                                    pen_flags ^= old_pen_flags;
-                                };
-
-                                let button = ButtonSource::TabletTool {
-                                    kind: TabletToolKind::Pen,
-                                    button: pen_flags_to_button(pen_flags),
-                                    data,
-                                };
-
-                                (kind, button)
-                            },
                             _ => (PointerKind::Unknown, ButtonSource::Unknown(0)),
                         };
 
@@ -2281,10 +2312,6 @@ unsafe fn public_window_callback_inner(
                             PT_TOUCH => PointerSource::Touch {
                                 finger_id,
                                 force: force_for_touch(pointer_info.pointerId),
-                            },
-                            PT_PEN => PointerSource::TabletTool {
-                                kind: TabletToolKind::Pen,
-                                data: tablet_tool_info_for_pen(pointer_info.pointerId).1,
                             },
                             _ => PointerSource::Unknown,
                         };
@@ -2865,18 +2892,4 @@ fn tablet_tool_info_for_pen(pointer_id: u32) -> (u32, TabletToolData) {
     });
 
     (tool_button, tool_data)
-}
-
-// NOTE: According to firefox, the buttons while can be combined, in
-// reality they are not.
-fn pen_flags_to_button(flags: u32) -> TabletToolButton {
-    if flags & PEN_FLAG_BARREL != 0 {
-        TabletToolButton::Barrel
-    } else if flags & PEN_FLAG_ERASER != 0 {
-        // NOTE: this is likely not a correct thing to do, but route
-        // it that way for now.
-        TabletToolButton::Other(PEN_FLAG_ERASER as u16)
-    } else {
-        TabletToolButton::Contact
-    }
 }

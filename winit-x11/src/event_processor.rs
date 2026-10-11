@@ -12,8 +12,8 @@ use winit_common::xkb::{self, Context, XkbState};
 use winit_core::application::ApplicationHandler;
 use winit_core::event::{
     ButtonSource, DeviceEvent, DeviceId, ElementState, FingerId, Ime, MouseButton,
-    MouseScrollDelta, PointerKind, PointerSource, RawKeyEvent, SurfaceSizeWriter, TouchPhase,
-    WindowEvent,
+    MouseScrollDelta, PointerKind, PointerSource, RawKeyEvent, SurfaceSizeWriter, TabletToolData,
+    TabletToolKind, TouchPhase, WindowEvent,
 };
 use winit_core::event_loop::DndAction;
 use winit_core::keyboard::ModifiersState;
@@ -42,6 +42,7 @@ use crate::event_loop::{
     ScrollOrientation, mkdid, mkwid,
 };
 use crate::ime::{ImeEvent, ImeEventReceiver, ImeReceiver, ImeRequest};
+use crate::tablet;
 use crate::util;
 use crate::util::cookie::GenericEventCookie;
 use crate::window::UnownedWindow;
@@ -1171,6 +1172,24 @@ impl EventProcessor {
         // Set the timestamp.
         self.target.xconn.set_timestamp(event.time as xproto::Timestamp);
 
+        let position = PhysicalPosition::new(event.event_x, event.event_y);
+
+        if let Some((kind, data)) = self.pen_data(event) {
+            let Some(button) = tablet::button(event.detail as u32) else {
+                return;
+            };
+            let event = WindowEvent::PointerButton {
+                device_id,
+                primary: true,
+                state,
+                position,
+                button: ButtonSource::TabletTool { kind, button, data },
+                is_macos_activation_click: false,
+            };
+            app.window_event(&self.target, window_id, event);
+            return;
+        }
+
         let Some(DeviceType::Mouse) = self
             .devices
             .borrow()
@@ -1184,8 +1203,6 @@ impl EventProcessor {
         if (event.flags & xinput2::XIPointerEmulated) != 0 {
             return;
         }
-
-        let position = PhysicalPosition::new(event.event_x, event.event_y);
 
         let event = match event.detail as u32 {
             xlib::Button1 => WindowEvent::PointerButton {
@@ -1257,9 +1274,56 @@ impl EventProcessor {
         app.window_event(&self.target, window_id, event);
     }
 
+    /// The tool and its data when the source of an event is a pen or an eraser.
+    fn pen_data(&self, event: &XIDeviceEvent) -> Option<(TabletToolKind, TabletToolData)> {
+        let mut devices = self.devices.borrow_mut();
+        let device = devices.get_mut(&mkdid(event.sourceid as xinput::DeviceId))?;
+        let kind = match device.r#type {
+            DeviceType::Pen => TabletToolKind::Pen,
+            DeviceType::Eraser => TabletToolKind::Eraser,
+            DeviceType::Mouse | DeviceType::Touch => return None,
+        };
+
+        let mask = unsafe {
+            slice::from_raw_parts(event.valuators.mask, event.valuators.mask_len as usize)
+        };
+        let mut values = Vec::new();
+        let mut value = event.valuators.values;
+        for i in 0..event.valuators.mask_len * 8 {
+            if !xinput2::XIMaskIsSet(mask, i) {
+                continue;
+            }
+
+            values.push((i, unsafe { *value }));
+            value = unsafe { value.offset(1) };
+        }
+
+        Some((kind, device.tablet.data(values)))
+    }
+
     fn xinput2_mouse_motion(&self, event: &XIDeviceEvent, app: &mut dyn ApplicationHandler) {
         // Set the timestamp.
         self.target.xconn.set_timestamp(event.time as xproto::Timestamp);
+
+        if let Some((kind, data)) = self.pen_data(event) {
+            let window = event.event as xproto::Window;
+            let new_cursor_pos = (event.event_x, event.event_y);
+            let known = self.with_window(window, |window| {
+                window.shared_state_lock().cursor_pos = Some(new_cursor_pos);
+            });
+            if known.is_none() {
+                return;
+            }
+
+            let event = WindowEvent::PointerMoved {
+                device_id: Some(mkdid(event.deviceid as xinput::DeviceId)),
+                primary: true,
+                position: PhysicalPosition::new(event.event_x, event.event_y),
+                source: PointerSource::TabletTool { kind, data },
+            };
+            app.window_event(&self.target, mkwid(window), event);
+            return;
+        }
 
         let Some(DeviceType::Mouse) = self
             .devices
@@ -1387,11 +1451,21 @@ impl EventProcessor {
         // been destroyed, which the user presumably doesn't want to deal with.
         if self.window_exists(window) {
             let window_id = mkwid(window);
+            let kind = match self
+                .devices
+                .borrow()
+                .get(&mkdid(event.sourceid as xinput::DeviceId))
+                .map(|device| device.r#type)
+            {
+                Some(DeviceType::Pen) => PointerKind::TabletTool(TabletToolKind::Pen),
+                Some(DeviceType::Eraser) => PointerKind::TabletTool(TabletToolKind::Eraser),
+                _ => PointerKind::Mouse,
+            };
             let event = WindowEvent::PointerLeft {
                 device_id: Some(mkdid(event.deviceid as xinput::DeviceId)),
                 primary: true,
                 position: Some(PhysicalPosition::new(event.event_x, event.event_y)),
-                kind: PointerKind::Mouse,
+                kind,
             };
             app.window_event(&self.target, window_id, event);
         }

@@ -17,6 +17,7 @@ mod ime;
 mod keyboard;
 mod keyboard_layout;
 mod monitor;
+mod pen;
 mod raw_input;
 mod window;
 mod window_state;

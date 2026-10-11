@@ -157,13 +157,15 @@ impl Dispatch2<ZwpTabletToolV2, WinitState> for TabletToolData {
                     _ => return,
                 };
 
-                // Map similar to SDL.
+                // The tip comes through `down` and `up`, the buttons on the side are the barrel
+                // and the further buttons, as on X11.
                 let button = match button {
                     // BTN_STYLUS.
-                    0x14b => TabletToolButton::Contact,
-                    0x14c => TabletToolButton::Barrel,
+                    0x14b => TabletToolButton::Barrel,
+                    // BTN_STYLUS2.
+                    0x14c => TabletToolButton::Other(1),
                     // BTN_STYLUS3.
-                    0x149 => TabletToolButton::Other(1),
+                    0x149 => TabletToolButton::Other(2),
                     // There's no defined conversion for any of that.
                     button => TabletToolButton::Other(button as u16),
                 };
